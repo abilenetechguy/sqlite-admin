@@ -1,0 +1,30 @@
+# Runtime configuration and secrets
+/config.php
+/config.php.tmp-*
+
+# SQLite databases and sidecar files
+/data/*.sqlite
+/data/*.sqlite3
+/data/*.db
+/data/*-wal
+/data/*-shm
+/data/*.backup
+/data/*.bak
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*~
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

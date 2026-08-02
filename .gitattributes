@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.php text eol=lf
+*.md text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.sqlite binary
+*.sqlite3 binary
+*.db binary
