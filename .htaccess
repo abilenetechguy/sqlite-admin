@@ -1,0 +1,10 @@
+Options -Indexes
+
+<FilesMatch "^(?:config\.php|.*\.(?:sqlite|sqlite3|db)(?:-(?:wal|shm))?|.*\.(?:bak|backup|log))$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Deny from all
+    </IfModule>
+</FilesMatch>

@@ -1,956 +1,1416 @@
 <?php
+declare(strict_types=1);
+
+const SQLITE_ADMIN_VERSION = '1.1.4';
+const SQLITE_ADMIN_PROJECT_URL = 'https://github.com/abilenetechguy/sqlite-admin';
+
 error_reporting(E_ALL);
-ini_set('display_errors', 1); // Turn off in production
 
 // ----- CONFIGURATION -----
 $configFile = __DIR__ . '/config.php';
-if (file_exists($configFile)) {
-    require_once $configFile;
-} else {
-    $dbFile = __DIR__ . '/database.sqlite';
-    $username = 'admin';
-    $passwordHash = password_hash('admin123', PASSWORD_DEFAULT);
-    $installed = false;
+$installed = false;
+$dbFile = '';
+$username = '';
+$passwordHash = '';
+$debug = false;
+$sessionName = 'sqlite_admin';
+
+if (is_file($configFile)) {
+    require $configFile;
 }
 
-if (!isset($installed) || !$installed) {
+ini_set('display_errors', !empty($debug) ? '1' : '0');
+ini_set('log_errors', '1');
+
+if (empty($installed)) {
     header('Location: install.php');
     exit;
 }
 
-// ----- MULTIPLE DATABASE SUPPORT -----
-session_start();
-$dbDir = dirname($dbFile);
-$databases = [];
-if (is_dir($dbDir)) {
-    $files = scandir($dbDir);
-    foreach ($files as $file) {
-        $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-        if (in_array($ext, ['sqlite', 'db', 'sqlite3'])) {
-            $databases[] = $file;
-        }
+if (!extension_loaded('sqlite3')) {
+    http_response_code(500);
+    exit('SQLite Admin requires the PHP SQLite3 extension.');
+}
+
+// ----- SESSION & SECURITY -----
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_name((string) $sessionName);
+    $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || ((int) ($_SERVER['SERVER_PORT'] ?? 0) === 443);
+    $scriptDirectory = str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/')));
+    $cookiePath = $scriptDirectory === '/' ? '/' : rtrim($scriptDirectory, '/') . '/';
+    if (PHP_VERSION_ID >= 70300) {
+        session_set_cookie_params([
+            'lifetime' => 0,
+            'path' => $cookiePath,
+            'secure' => $isHttps,
+            'httponly' => true,
+            'samesite' => 'Strict',
+        ]);
+    } else {
+        session_set_cookie_params(0, $cookiePath, '', $isHttps, true);
+    }
+    session_start();
+}
+
+// Eight-hour inactivity timeout.
+$now = time();
+if (isset($_SESSION['last_activity'])
+    && $now - (int) $_SESSION['last_activity'] > 28800) {
+    session_unset();
+    session_destroy();
+    session_start();
+    session_regenerate_id(true);
+}
+$_SESSION['last_activity'] = $now;
+
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: no-referrer');
+header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; font-src 'self' https://cdnjs.cloudflare.com data:; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+
+function h($value)
+{
+    return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+// Compatibility helpers for PHP 7.x. PHP 8 provides these functions natively.
+if (!function_exists('str_contains')) {
+    function str_contains($haystack, $needle)
+    {
+        return $needle === '' || strpos((string) $haystack, (string) $needle) !== false;
+    }
+}
+if (!function_exists('str_starts_with')) {
+    function str_starts_with($haystack, $needle)
+    {
+        $needle = (string) $needle;
+        return $needle === '' || substr((string) $haystack, 0, strlen($needle)) === $needle;
     }
 }
 
-if (isset($_GET['db']) && in_array($_GET['db'], $databases)) {
-    $dbFile = $dbDir . '/' . $_GET['db'];
-    $_SESSION['current_db'] = $dbFile;
-} elseif (isset($_SESSION['current_db']) && file_exists($_SESSION['current_db'])) {
-    $dbFile = $_SESSION['current_db'];
-} else {
-    $_SESSION['current_db'] = $dbFile;
+function isListArray(array $array)
+{
+    $expectedKey = 0;
+    foreach ($array as $key => $value) {
+        if ($key !== $expectedKey) {
+            return false;
+        }
+        $expectedKey++;
+    }
+    return true;
+}
+
+function jsonEncodeChecked($value, $options = 0)
+{
+    if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) {
+        $options |= constant('JSON_INVALID_UTF8_SUBSTITUTE');
+    }
+    $encoded = json_encode($value, $options);
+    if ($encoded === false) {
+        throw new RuntimeException('JSON encoding failed: ' . json_last_error_msg());
+    }
+    return $encoded;
+}
+
+function jsonDecodeChecked($json, $associative = true)
+{
+    $decoded = json_decode((string) $json, (bool) $associative);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        throw new RuntimeException('JSON parsing failed: ' . json_last_error_msg());
+    }
+    return $decoded;
+}
+
+function csrfField()
+{
+    return '<input type="hidden" name="csrf_token" value="'
+        . h($_SESSION['csrf_token'] ?? '') . '">';
+}
+
+function requireCsrf()
+{
+    $submitted = (string) ($_POST['csrf_token'] ?? '');
+    $expected = (string) ($_SESSION['csrf_token'] ?? '');
+    if ($submitted === '' || $expected === '' || !hash_equals($expected, $submitted)) {
+        http_response_code(403);
+        exit('The security token is missing or invalid. Reload the page and try again.');
+    }
+}
+
+function quoteIdentifier($identifier)
+{
+    return '"' . str_replace('"', '""', $identifier) . '"';
+}
+
+function isDatabaseFilename($filename)
+{
+    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    return in_array($extension, ['sqlite', 'db', 'sqlite3'], true)
+        && basename($filename) === $filename;
+}
+
+function setFlash($type, $message)
+{
+    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
+}
+
+function getQueryString($table, $search, array $colFilters, array $extra = [])
+{
+    $params = [];
+    if ($table !== '') $params['table'] = $table;
+    if ($search !== '') $params['search'] = $search;
+    if ($colFilters !== []) $params['col_filters'] = $colFilters;
+    $params = array_merge($params, $extra);
+    return $params === [] ? '?' : '?' . http_build_query($params);
+}
+
+function currentAppPath()
+{
+    // Build a canonical URL for the real PHP file instead of trusting a rewritten
+    // request such as /admin/admin. This also recovers cleanly from directory-index
+    // requests where SCRIPT_NAME may end with a slash.
+    $scriptName = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? ''));
+    if ($scriptName !== '') {
+        if (substr($scriptName, -1) === '/') {
+            return rtrim($scriptName, '/') . '/admin.php';
+        }
+        if (strcasecmp(basename($scriptName), 'admin.php') === 0) {
+            return $scriptName;
+        }
+
+        $directory = str_replace('\\', '/', dirname($scriptName));
+        return ($directory === '/' ? '' : rtrim($directory, '/')) . '/admin.php';
+    }
+
+    return 'admin.php';
+}
+
+function redirectTo($location)
+{
+    header('Location: ' . $location);
+    exit;
 }
 
 // ----- LOGIN -----
-if (!isset($_SESSION['admin_logged'])) {
-    if (isset($_POST['username']) && isset($_POST['password'])) {
-        $submittedUser = $_POST['username'];
-        $submittedPass = $_POST['password'];
-        if ($submittedUser === $username && password_verify($submittedPass, $passwordHash)) {
-            $_SESSION['admin_logged'] = true;
-            if (!isset($_SESSION['theme'])) {
-                $_SESSION['theme'] = 'light';
-            }
-            unset($_SESSION['flash']);
-            if (!isset($_SESSION['undo_history'])) {
-                $_SESSION['undo_history'] = [];
-            }
-        } else {
-            $error = 'Invalid username or password';
+if (empty($_SESSION['admin_logged'])) {
+    $error = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
+        requireCsrf();
+        $submittedUser = trim((string) ($_POST['username'] ?? ''));
+        $submittedPass = (string) ($_POST['password'] ?? '');
+        $failures = (int) ($_SESSION['login_failures'] ?? 0);
+
+        if ($failures >= 5) {
+            usleep(750000);
         }
-    } else {
-        if (isset($_POST['username']) || isset($_POST['password'])) {
-            $error = 'Please fill in both fields';
+
+        if ($submittedUser !== ''
+            && hash_equals((string) $username, $submittedUser)
+            && password_verify($submittedPass, (string) $passwordHash)) {
+            session_regenerate_id(true);
+            $_SESSION['admin_logged'] = true;
+            $_SESSION['theme'] = $_SESSION['theme'] ?? 'light';
+            $_SESSION['undo_history'] = $_SESSION['undo_history'] ?? [];
+            $_SESSION['login_failures'] = 0;
+            $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        } else {
+            $_SESSION['login_failures'] = $failures + 1;
+            $error = 'Invalid username or password.';
         }
     }
-    if (!isset($_SESSION['admin_logged'])) {
-        // Show login screen
-        ?>
-        <!DOCTYPE html>
-        <html>
-        <head><title>SQLite Admin – Login</title></head>
-        <body style="font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f4;margin:0;">
-            <div style="background:#fff;padding:30px;border-radius:8px;width:320px;box-shadow:0 4px 12px rgba(0,0,0,0.1);">
-                <h1 style="color:#0056b3;margin-top:0;text-align:center;">🔐 SQLite Admin</h1>
-                <?php if (isset($error)) echo '<p style="color:red;text-align:center;">'.$error.'</p>'; ?>
-                <form method="post">
-                    <div style="margin-bottom:12px;">
-                        <label style="display:block;font-weight:600;margin-bottom:4px;">Username</label>
-                        <input type="text" name="username" placeholder="Enter username" value="<?php echo isset($_POST['username']) ? htmlspecialchars($_POST['username']) : ''; ?>" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;">
-                    </div>
-                    <div style="margin-bottom:16px;">
-                        <label style="display:block;font-weight:600;margin-bottom:4px;">Password</label>
-                        <input type="password" name="password" placeholder="Enter password" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;">
-                    </div>
-                    <button type="submit" style="width:100%;padding:10px;background:#0056b3;color:white;border:none;border-radius:4px;cursor:pointer;font-size:1rem;">Login</button>
-                </form>
-            </div>
-        </body>
-        </html>
-        <?php
+
+    if (empty($_SESSION['admin_logged'])) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SQLite Admin – Login</title>
+    </head>
+    <body style="font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f4f4f4;margin:0;padding:1rem;">
+        <div style="background:#fff;padding:30px;border-radius:10px;width:min(360px,100%);box-shadow:0 4px 18px rgba(0,0,0,.12);">
+            <h1 style="color:#2563eb;margin:0 0 1.25rem;text-align:center;font-size:1.6rem;">SQLite Admin</h1>
+            <?php if ($error !== ''): ?>
+                <p style="color:#991b1b;background:#fee2e2;border:1px solid #fecaca;border-radius:6px;padding:.65rem;text-align:center;"><?php echo h($error); ?></p>
+            <?php endif; ?>
+            <form method="post" autocomplete="on">
+                <?php echo csrfField(); ?>
+                <input type="hidden" name="login" value="1">
+                <div style="margin-bottom:12px;">
+                    <label for="login-username" style="display:block;font-weight:600;margin-bottom:4px;">Username</label>
+                    <input id="login-username" type="text" name="username" autocomplete="username" required value="<?php echo h($_POST['username'] ?? ''); ?>" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;">
+                </div>
+                <div style="margin-bottom:16px;">
+                    <label for="login-password" style="display:block;font-weight:600;margin-bottom:4px;">Password</label>
+                    <input id="login-password" type="password" name="password" autocomplete="current-password" required style="width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;">
+                </div>
+                <button type="submit" style="width:100%;padding:10px;background:#2563eb;color:white;border:none;border-radius:4px;cursor:pointer;font-size:1rem;">Login</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    <?php
         exit;
     }
+}
+
+// ----- MULTIPLE DATABASE SUPPORT -----
+$configuredDbFile = (string) $dbFile;
+$dbDir = dirname($configuredDbFile);
+$databases = [];
+if (is_dir($dbDir)) {
+    foreach (scandir($dbDir) ?: [] as $file) {
+        if (isDatabaseFilename($file) && is_file($dbDir . DIRECTORY_SEPARATOR . $file)) {
+            $databases[] = $file;
+        }
+    }
+    natcasesort($databases);
+    $databases = array_values($databases);
+}
+
+if (isset($_GET['db']) && in_array((string) $_GET['db'], $databases, true)) {
+    $dbFile = $dbDir . DIRECTORY_SEPARATOR . (string) $_GET['db'];
+    $_SESSION['current_db'] = $dbFile;
+} elseif (!empty($_SESSION['current_db'])
+    && is_file((string) $_SESSION['current_db'])
+    && dirname((string) $_SESSION['current_db']) === $dbDir) {
+    $dbFile = (string) $_SESSION['current_db'];
+} else {
+    $dbFile = $configuredDbFile;
+    $_SESSION['current_db'] = $dbFile;
 }
 
 // ----- THEME TOGGLE -----
 if (isset($_GET['theme'])) {
     $_SESSION['theme'] = $_GET['theme'] === 'dark' ? 'dark' : 'light';
-    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
-    exit;
+    $themeReturnParameters = $_GET;
+    unset($themeReturnParameters['theme']);
+    $themeReturnUrl = currentAppPath();
+    if ($themeReturnParameters !== []) {
+        $themeReturnUrl .= '?' . http_build_query($themeReturnParameters);
+    }
+    redirectTo($themeReturnUrl);
 }
 $theme = $_SESSION['theme'] ?? 'light';
 $isDark = ($theme === 'dark');
 
 // ----- DATABASE CONNECTION -----
 try {
-    if (!extension_loaded('sqlite3')) {
-        throw new Exception('SQLite3 extension not loaded.');
+    if (!is_file($dbFile)) {
+        throw new RuntimeException('Database file not found: ' . $dbFile);
     }
-    if (!file_exists($dbFile)) {
-        throw new Exception('Database file not found: ' . $dbFile);
-    }
-    $db = new SQLite3($dbFile);
+    $db = new SQLite3($dbFile, SQLITE3_OPEN_READWRITE);
     $db->enableExceptions(true);
-} catch (Exception $e) {
-    die('<div style="font-family:sans-serif;padding:20px;max-width:600px;margin:40px auto;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,0.1);">
-            <h2 style="color:#d9534f;">Database Error</h2>
-            <p>' . htmlspecialchars($e->getMessage()) . '</p>
-            <p><small>Please check the database file path and permissions.</small></p>
-          </div>');
-}
-
-// ----- LOGOUT -----
-if (isset($_GET['logout'])) {
-    session_destroy();
-    header('Location: ' . $_SERVER['PHP_SELF']);
-    exit;
+    $db->busyTimeout(5000);
+    $db->exec('PRAGMA foreign_keys = ON');
+} catch (Throwable $exception) {
+    http_response_code(500);
+    $message = !empty($debug)
+        ? $exception->getMessage()
+        : 'The database could not be opened. Check its path and permissions.';
+    exit('<div style="font-family:system-ui,sans-serif;padding:20px;max-width:680px;margin:40px auto;background:#fff;border:1px solid #ddd;border-radius:8px;"><h2 style="color:#b91c1c;">Database Error</h2><p>' . h($message) . '</p></div>');
 }
 
 // ----- HANDLE ACTIONS -----
-$action = $_GET['action'] ?? 'browse';
-$table = isset($_GET['table']) ? trim($_GET['table']) : '';
-$search = isset($_GET['search']) ? trim($_GET['search']) : '';
-$offset = isset($_GET['offset']) ? (int)$_GET['offset'] : 0;
-$limit = 100;
+$action = (string) ($_GET['action'] ?? 'browse');
+$table = trim((string) ($_GET['table'] ?? ''));
+$search = trim((string) ($_GET['search'] ?? ''));
+$offset = max(0, (int) ($_GET['offset'] ?? 0));
+$allowedLimits = [25, 50, 100, 250, 500];
+$limit = (int) ($_GET['limit'] ?? ($_SESSION['row_limit'] ?? 100));
+if (!in_array($limit, $allowedLimits, true)) $limit = 100;
+$_SESSION['row_limit'] = $limit;
 
 $colFilters = [];
 if (isset($_GET['col_filters']) && is_array($_GET['col_filters'])) {
-    foreach ($_GET['col_filters'] as $col => $val) {
-        $col = trim($col);
-        $val = trim($val);
-        if ($col !== '' && $val !== '') {
-            $colFilters[$col] = $val;
+    foreach ($_GET['col_filters'] as $column => $value) {
+        $column = trim((string) $column);
+        $value = trim((string) $value);
+        if ($column !== '' && $value !== '') $colFilters[$column] = $value;
+    }
+}
+
+if ($action === 'logout' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    requireCsrf();
+    $sessionCookieName = session_name();
+    $sessionCookieParameters = session_get_cookie_params();
+    session_unset();
+    session_destroy();
+    if (ini_get('session.use_cookies')) {
+        $logoutCookiePath = !empty($sessionCookieParameters['path']) ? $sessionCookieParameters['path'] : '/';
+        $logoutCookieDomain = isset($sessionCookieParameters['domain']) ? $sessionCookieParameters['domain'] : '';
+        $logoutCookieSecure = !empty($sessionCookieParameters['secure']);
+        $logoutCookieHttpOnly = !isset($sessionCookieParameters['httponly']) || !empty($sessionCookieParameters['httponly']);
+        if (PHP_VERSION_ID >= 70300) {
+            setcookie($sessionCookieName, '', [
+                'expires' => time() - 42000,
+                'path' => $logoutCookiePath,
+                'domain' => $logoutCookieDomain,
+                'secure' => $logoutCookieSecure,
+                'httponly' => $logoutCookieHttpOnly,
+                'samesite' => 'Strict',
+            ]);
+        } else {
+            setcookie(
+                $sessionCookieName,
+                '',
+                time() - 42000,
+                $logoutCookiePath,
+                $logoutCookieDomain,
+                $logoutCookieSecure,
+                $logoutCookieHttpOnly
+            );
         }
     }
+    redirectTo(currentAppPath());
 }
 
-function setFlash($type, $message) {
-    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
+function getDatabaseObjectType(SQLite3 $db, $name)
+{
+    if ($name === '') return null;
+    $statement = $db->prepare(
+        "SELECT type FROM sqlite_master WHERE name = :name AND type IN ('table','view')"
+    );
+    $statement->bindValue(':name', $name, SQLITE3_TEXT);
+    $result = $statement->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    return $row ? (string) $row['type'] : null;
 }
 
-function getQueryString($table, $search, $colFilters, $extra = []) {
-    $params = ['table' => $table];
-    if ($search) $params['search'] = $search;
-    if (!empty($colFilters)) $params['col_filters'] = $colFilters;
-    $params = array_merge($params, $extra);
-    return '?' . http_build_query($params);
+$objectType = getDatabaseObjectType($db, $table);
+if ($table !== '' && $objectType === null) {
+    setFlash('error', 'The selected table or view no longer exists.');
+    $table = '';
+}
+$isView = ($objectType === 'view');
+
+$viewWriteActions = [
+    'import_table', 'bulk_delete', 'delete', 'update', 'insert',
+    'drop_table', 'rename_table', 'add_column', 'rename_column'
+];
+if ($isView && in_array($action, $viewWriteActions, true)) {
+    setFlash('error', 'Views are read-only in the visual editor. Edit the underlying tables instead.');
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
-// ----- UNDO SYSTEM -----
-function pushHistory($action, $table, $data) {
-    if (!isset($_SESSION['undo_history'])) {
-        $_SESSION['undo_history'] = [];
+$mutatingActions = [
+    'undo', 'import_db', 'delete_db', 'drop_table', 'rename_table',
+    'add_column', 'rename_column', 'create_table', 'import_table',
+    'bulk_delete', 'delete', 'update'
+];
+if (in_array($action, $mutatingActions, true)) {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        exit('This action requires POST.');
     }
-    $entry = ['action' => $action, 'table' => $table, 'data' => $data, 'time' => time()];
-    array_unshift($_SESSION['undo_history'], $entry);
-    if (count($_SESSION['undo_history']) > 5) {
-        array_pop($_SESSION['undo_history']);
+    requireCsrf();
+}
+if ($action === 'query'
+    && $_SERVER['REQUEST_METHOD'] === 'POST'
+    && array_key_exists('sql', $_POST)) {
+    requireCsrf();
+}
+
+// ----- DATABASE HELPERS -----
+function pushHistory($action, $table, array $data)
+{
+    $_SESSION['undo_history'] = $_SESSION['undo_history'] ?? [];
+    array_unshift($_SESSION['undo_history'], [
+        'action' => $action,
+        'table' => $table,
+        'data' => $data,
+        'time' => time(),
+    ]);
+    $_SESSION['undo_history'] = array_slice($_SESSION['undo_history'], 0, 5);
+}
+
+function tableInfo(SQLite3 $db, $table)
+{
+    $result = $db->query('PRAGMA table_info(' . quoteIdentifier($table) . ')');
+    $columns = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $columns[] = $row;
     }
+    return $columns;
+}
+
+function tableLocator(SQLite3 $db, $table)
+{
+    $primaryKeys = [];
+    foreach (tableInfo($db, $table) as $column) {
+        if ((int) $column['pk'] > 0) {
+            $primaryKeys[(int) $column['pk']] = [
+                'name' => (string) $column['name'],
+                'type' => (string) $column['type'],
+            ];
+        }
+    }
+    ksort($primaryKeys);
+    if (count($primaryKeys) === 1) {
+        $primaryKey = array_values($primaryKeys)[0];
+        return [
+            'column' => $primaryKey['name'],
+            'rowid' => false,
+            'type' => $primaryKey['type'],
+        ];
+    }
+
+    try {
+        $db->querySingle('SELECT rowid FROM ' . quoteIdentifier($table) . ' LIMIT 1');
+        return ['column' => 'rowid', 'rowid' => true, 'type' => 'INTEGER'];
+    } catch (Throwable $ignoredException) {
+        return ['column' => null, 'rowid' => false, 'type' => ''];
+    }
+}
+
+function bindTyped(SQLite3Stmt $statement, $parameter, $value, $declaredType = '')
+{
+    if ($value === null) {
+        $statement->bindValue($parameter, null, SQLITE3_NULL);
+        return;
+    }
+
+    $type = strtoupper($declaredType);
+    if (is_int($value) || (str_contains($type, 'INT') && is_numeric((string) $value))) {
+        $statement->bindValue($parameter, (int) $value, SQLITE3_INTEGER);
+    } elseif (is_float($value)
+        || ((str_contains($type, 'REAL') || str_contains($type, 'FLOA') || str_contains($type, 'DOUB'))
+            && is_numeric((string) $value))) {
+        $statement->bindValue($parameter, (float) $value, SQLITE3_FLOAT);
+    } elseif (str_contains($type, 'BLOB')) {
+        $statement->bindValue($parameter, (string) $value, SQLITE3_BLOB);
+    } else {
+        $statement->bindValue($parameter, (string) $value, SQLITE3_TEXT);
+    }
+}
+
+function fetchRowByLocator(SQLite3 $db, $table, array $locator, $value)
+{
+    if (empty($locator['column'])) return null;
+    $columnSql = !empty($locator['rowid']) ? 'rowid' : quoteIdentifier((string) $locator['column']);
+    $statement = $db->prepare(
+        'SELECT * FROM ' . quoteIdentifier($table) . ' WHERE ' . $columnSql . ' = :locator LIMIT 1'
+    );
+    bindTyped($statement, ':locator', $value, (string) ($locator['type'] ?? ''));
+    $result = $statement->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    return $row ?: null;
+}
+
+function deleteByLocator(SQLite3 $db, $table, array $locator, $value)
+{
+    if (empty($locator['column'])) {
+        throw new RuntimeException('This table has no single editable row identifier.');
+    }
+    $columnSql = !empty($locator['rowid']) ? 'rowid' : quoteIdentifier((string) $locator['column']);
+    $statement = $db->prepare(
+        'DELETE FROM ' . quoteIdentifier($table) . ' WHERE ' . $columnSql . ' = :locator'
+    );
+    bindTyped($statement, ':locator', $value, (string) ($locator['type'] ?? ''));
+    $statement->execute();
+}
+
+function insertAssocRow(SQLite3 $db, $table, array $row)
+{
+    if ($row === []) return;
+    $columns = array_keys($row);
+    $declaredTypes = [];
+    foreach (tableInfo($db, $table) as $columnInfo) {
+        $declaredTypes[(string) $columnInfo['name']] = (string) $columnInfo['type'];
+    }
+    $columnSql = implode(', ', array_map('quoteIdentifier', $columns));
+    $placeholders = [];
+    foreach ($columns as $index => $column) $placeholders[] = ':v' . $index;
+    $statement = $db->prepare(
+        'INSERT INTO ' . quoteIdentifier($table)
+        . ' (' . $columnSql . ') VALUES (' . implode(', ', $placeholders) . ')'
+    );
+    foreach ($columns as $index => $column) {
+        bindTyped(
+            $statement,
+            ':v' . $index,
+            $row[$column],
+            $declaredTypes[(string) $column] ?? ''
+        );
+    }
+    $statement->execute();
+}
+
+function restoreAssocRow(SQLite3 $db, $table, array $row, array $locator, $locatorValue)
+{
+    $assignments = [];
+    $statementValues = [];
+    $declaredTypes = [];
+    foreach (tableInfo($db, $table) as $columnInfo) {
+        $declaredTypes[(string) $columnInfo['name']] = (string) $columnInfo['type'];
+    }
+    foreach ($row as $column => $value) {
+        if (empty($locator['rowid']) && $column === $locator['column']) continue;
+        $placeholder = ':v' . count($statementValues);
+        $assignments[] = quoteIdentifier((string) $column) . ' = ' . $placeholder;
+        $statementValues[$placeholder] = [
+            'value' => $value,
+            'type' => $declaredTypes[(string) $column] ?? '',
+        ];
+    }
+    if ($assignments === []) return;
+    $locatorSql = !empty($locator['rowid']) ? 'rowid' : quoteIdentifier((string) $locator['column']);
+    $statement = $db->prepare(
+        'UPDATE ' . quoteIdentifier($table) . ' SET ' . implode(', ', $assignments)
+        . ' WHERE ' . $locatorSql . ' = :locator'
+    );
+    foreach ($statementValues as $placeholder => $entry) {
+        bindTyped($statement, $placeholder, $entry['value'], $entry['type']);
+    }
+    $locatorType = empty($locator['rowid'])
+        ? ($declaredTypes[(string) $locator['column']] ?? '')
+        : 'INTEGER';
+    bindTyped($statement, ':locator', $locatorValue, $locatorType);
+    $statement->execute();
+}
+
+function buildWhere(array $columns, $search, array $filters, array &$parameters)
+{
+    $clauses = [];
+    $parameters = [];
+    if ($search !== '') {
+        $parts = [];
+        foreach ($columns as $index => $column) {
+            $placeholder = ':search' . $index;
+            $parts[] = 'CAST(' . quoteIdentifier((string) $column) . ' AS TEXT) LIKE ' . $placeholder;
+            $parameters[$placeholder] = '%' . $search . '%';
+        }
+        if ($parts !== []) $clauses[] = '(' . implode(' OR ', $parts) . ')';
+    }
+    foreach ($filters as $column => $value) {
+        if (!in_array($column, $columns, true)) continue;
+        $placeholder = ':filter' . count($parameters);
+        $clauses[] = 'CAST(' . quoteIdentifier($column) . ' AS TEXT) LIKE ' . $placeholder;
+        $parameters[$placeholder] = '%' . $value . '%';
+    }
+    return $clauses === [] ? '' : ' WHERE ' . implode(' AND ', $clauses);
+}
+
+function queryWithTextParameters(SQLite3 $db, $sql, array $parameters)
+{
+    $statement = $db->prepare($sql);
+    foreach ($parameters as $placeholder => $value) {
+        $statement->bindValue($placeholder, (string) $value, SQLITE3_TEXT);
+    }
+    return $statement->execute();
+}
+
+function sqlLiteral($value, $declaredType = '')
+{
+    if ($value === null) return 'NULL';
+    if (is_int($value) || is_float($value)) return (string) $value;
+    $stringValue = (string) $value;
+    if (str_contains(strtoupper($declaredType), 'BLOB')
+        || preg_match('//u', $stringValue) !== 1) {
+        return "X'" . bin2hex($stringValue) . "'";
+    }
+    return "'" . SQLite3::escapeString($stringValue) . "'";
+}
+
+function safeDownloadName($name, $fallback)
+{
+    $clean = preg_replace('/[^A-Za-z0-9._-]+/', '_', $name) ?: '';
+    return trim($clean, '._-') !== '' ? $clean : $fallback;
+}
+
+function createDatabaseSnapshot(SQLite3 $db, $sourcePath, $destinationPath)
+{
+    if (method_exists($db, 'backup')) {
+        $backup = new SQLite3($destinationPath);
+        $backup->enableExceptions(true);
+        try {
+            if (!$db->backup($backup)) {
+                throw new RuntimeException('SQLite backup failed.');
+            }
+        } finally {
+            $backup->close();
+        }
+        return;
+    }
+
+    $version = SQLite3::version();
+    $versionNumber = isset($version['versionNumber']) ? (int) $version['versionNumber'] : 0;
+    if ($versionNumber >= 3027000) {
+        @unlink($destinationPath);
+        $escapedPath = SQLite3::escapeString($destinationPath);
+        $db->exec("VACUUM INTO '" . $escapedPath . "'");
+        return;
+    }
+
+    // PHP versions before 7.4 do not expose SQLite3::backup(). Flush WAL data
+    // before using the safest fallback available on older SQLite libraries.
+    @$db->exec('PRAGMA wal_checkpoint(FULL)');
+    if (!copy($sourcePath, $destinationPath)) {
+        throw new RuntimeException('Database snapshot could not be copied.');
+    }
+}
+
+function encodePortableValue($value, $declaredType, $forCsv = false)
+{
+    if ($value === null) return $forCsv ? '\\N' : null;
+    if (str_contains(strtoupper($declaredType), 'BLOB')) {
+        return 'base64:' . base64_encode((string) $value);
+    }
+    if ($forCsv && (string) $value === '\\N') return '\\\\N';
+    return $value;
+}
+
+function decodePortableValue($value, $declaredType, $fromCsv = false)
+{
+    if ($fromCsv && $value === '\\N') return null;
+    if ($fromCsv && $value === '\\\\N') return '\\N';
+    if (str_contains(strtoupper($declaredType), 'BLOB')
+        && is_string($value)
+        && str_starts_with($value, 'base64:')) {
+        $decoded = base64_decode(substr($value, 7), true);
+        if ($decoded === false) {
+            throw new RuntimeException('Invalid base64 BLOB value.');
+        }
+        return $decoded;
+    }
+    return $value;
 }
 
 // ----- UNDO -----
 if ($action === 'undo') {
     if (empty($_SESSION['undo_history'])) {
         setFlash('error', 'Nothing to undo.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
+
     $entry = array_shift($_SESSION['undo_history']);
-    $undoTable = $entry['table'];
-    $undoAction = $entry['action'];
-    $undoData = $entry['data'];
-    $safeTable = SQLite3::escapeString($undoTable);
+    $undoTable = (string) $entry['table'];
+    $undoAction = (string) $entry['action'];
+    $undoData = (array) $entry['data'];
+
     try {
+        $db->exec('BEGIN IMMEDIATE');
         switch ($undoAction) {
             case 'insert':
-                if (isset($undoData['pk_col']) && isset($undoData['pk_val'])) {
-                    $pkCol = SQLite3::escapeString($undoData['pk_col']);
-                    $pkVal = SQLite3::escapeString($undoData['pk_val']);
-                    $db->exec("DELETE FROM $safeTable WHERE $pkCol = '$pkVal'");
-                    setFlash('success', 'Undo insert: row deleted.');
-                } else {
-                    setFlash('error', 'Cannot undo insert: missing primary key.');
-                }
+                deleteByLocator($db, $undoTable, (array) $undoData['locator'], $undoData['locator_value']);
+                setFlash('success', 'Undo insert: row deleted.');
                 break;
             case 'update':
-                if (isset($undoData['pk_col']) && isset($undoData['pk_val']) && isset($undoData['old_data'])) {
-                    $pkCol = SQLite3::escapeString($undoData['pk_col']);
-                    $pkVal = SQLite3::escapeString($undoData['pk_val']);
-                    $set = [];
-                    foreach ($undoData['old_data'] as $col => $val) {
-                        if ($col !== $pkCol) {
-                            $safeCol = SQLite3::escapeString($col);
-                            $safeVal = SQLite3::escapeString($val);
-                            $set[] = "$safeCol = '$safeVal'";
-                        }
-                    }
-                    if (!empty($set)) {
-                        $db->exec("UPDATE $safeTable SET " . implode(', ', $set) . " WHERE $pkCol = '$pkVal'");
-                        setFlash('success', 'Undo update: row restored.');
-                    } else {
-                        setFlash('error', 'No changes to restore.');
-                    }
-                } else {
-                    setFlash('error', 'Cannot undo update: missing data.');
-                }
+                restoreAssocRow(
+                    $db,
+                    $undoTable,
+                    (array) $undoData['old_data'],
+                    (array) $undoData['locator'],
+                    $undoData['locator_value']
+                );
+                setFlash('success', 'Undo update: row restored.');
                 break;
             case 'delete':
-                if (isset($undoData['row_data']) && is_array($undoData['row_data'])) {
-                    $cols = array_keys($undoData['row_data']);
-                    $vals = array_map(function($v) { return "'" . SQLite3::escapeString($v) . "'"; }, array_values($undoData['row_data']));
-                    $colStr = implode(',', array_map(function($c) { return SQLite3::escapeString($c); }, $cols));
-                    $valStr = implode(',', $vals);
-                    $db->exec("INSERT INTO $safeTable ($colStr) VALUES ($valStr)");
-                    setFlash('success', 'Undo delete: row restored.');
-                } else {
-                    setFlash('error', 'Cannot undo delete: missing row data.');
-                }
+                insertAssocRow($db, $undoTable, (array) $undoData['row_data']);
+                setFlash('success', 'Undo delete: row restored.');
                 break;
             case 'bulk_delete':
-                if (isset($undoData['rows']) && is_array($undoData['rows'])) {
-                    $inserted = 0;
-                    foreach ($undoData['rows'] as $row) {
-                        $cols = array_keys($row);
-                        $vals = array_map(function($v) { return "'" . SQLite3::escapeString($v) . "'"; }, array_values($row));
-                        $colStr = implode(',', array_map(function($c) { return SQLite3::escapeString($c); }, $cols));
-                        $valStr = implode(',', $vals);
-                        $db->exec("INSERT INTO $safeTable ($colStr) VALUES ($valStr)");
-                        $inserted++;
-                    }
-                    setFlash('success', "Undo bulk delete: $inserted rows restored.");
-                } else {
-                    setFlash('error', 'Cannot undo bulk delete: missing rows data.');
-                }
+                foreach ((array) $undoData['rows'] as $row) insertAssocRow($db, $undoTable, (array) $row);
+                setFlash('success', 'Undo bulk delete: rows restored.');
                 break;
             case 'rename_table':
-                if (isset($undoData['old_name'])) {
-                    $newName = SQLite3::escapeString($undoTable);
-                    $oldName = SQLite3::escapeString($undoData['old_name']);
-                    $db->exec("ALTER TABLE $newName RENAME TO $oldName");
-                    setFlash('success', 'Undo rename: table renamed back.');
-                    $table = $undoData['old_name'];
-                } else {
-                    setFlash('error', 'Cannot undo rename: missing old name.');
-                }
+                $db->exec(
+                    'ALTER TABLE ' . quoteIdentifier($undoTable)
+                    . ' RENAME TO ' . quoteIdentifier((string) $undoData['old_name'])
+                );
+                $table = (string) $undoData['old_name'];
+                setFlash('success', 'Undo rename: table renamed back.');
                 break;
             case 'rename_column':
-                if (isset($undoData['old_col']) && isset($undoData['new_col'])) {
-                    $safeOld = SQLite3::escapeString($undoData['old_col']);
-                    $safeNew = SQLite3::escapeString($undoData['new_col']);
-                    $db->exec("ALTER TABLE $safeTable RENAME COLUMN $safeNew TO $safeOld");
-                    setFlash('success', 'Undo rename column: column renamed back.');
-                } else {
-                    setFlash('error', 'Cannot undo rename column: missing data.');
-                }
+                $db->exec(
+                    'ALTER TABLE ' . quoteIdentifier($undoTable)
+                    . ' RENAME COLUMN ' . quoteIdentifier((string) $undoData['new_col'])
+                    . ' TO ' . quoteIdentifier((string) $undoData['old_col'])
+                );
+                setFlash('success', 'Undo rename column: column renamed back.');
                 break;
             case 'add_column':
-                if (isset($undoData['col_name'])) {
-                    $version = $db->querySingle("SELECT sqlite_version()");
-                    if (version_compare($version, '3.35.0', '>=')) {
-                        $safeCol = SQLite3::escapeString($undoData['col_name']);
-                        $db->exec("ALTER TABLE $safeTable DROP COLUMN $safeCol");
-                        setFlash('success', 'Undo add column: column dropped.');
-                    } else {
-                        setFlash('error', 'Cannot undo add column: SQLite version does not support DROP COLUMN (requires 3.35.0+).');
-                    }
-                } else {
-                    setFlash('error', 'Cannot undo add column: missing column name.');
+                $version = (string) $db->querySingle('SELECT sqlite_version()');
+                if (version_compare($version, '3.35.0', '<')) {
+                    throw new RuntimeException('DROP COLUMN requires SQLite 3.35.0 or newer.');
                 }
+                $db->exec(
+                    'ALTER TABLE ' . quoteIdentifier($undoTable)
+                    . ' DROP COLUMN ' . quoteIdentifier((string) $undoData['col_name'])
+                );
+                setFlash('success', 'Undo add column: column dropped.');
                 break;
             default:
-                setFlash('error', 'Unknown action, cannot undo.');
+                throw new RuntimeException('This action cannot be undone.');
         }
-    } catch (Exception $e) {
-        setFlash('error', 'Undo failed: ' . $e->getMessage());
+        $db->exec('COMMIT');
+    } catch (Throwable $exception) {
+        try { $db->exec('ROLLBACK'); } catch (Throwable $ignoredException) {}
+        setFlash('error', 'Undo failed: ' . $exception->getMessage());
     }
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- GET SCHEMA (AJAX) -----
 if ($action === 'get_schema' && isset($_GET['table'])) {
-    $tableName = trim($_GET['table']);
-    $safeTable = SQLite3::escapeString($tableName);
-    $result = $db->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='$safeTable'");
+    $statement = $db->prepare(
+        "SELECT sql FROM sqlite_master WHERE name = :name AND type IN ('table','view')"
+    );
+    $statement->bindValue(':name', trim((string) $_GET['table']), SQLITE3_TEXT);
+    $result = $statement->execute();
     $row = $result->fetchArray(SQLITE3_ASSOC);
-    $schema = $row ? $row['sql'] : 'Schema not found.';
-    header('Content-Type: text/plain');
-    echo $schema;
+    header('Content-Type: text/plain; charset=UTF-8');
+    echo $row ? (string) $row['sql'] : 'Schema not found.';
     exit;
 }
 
-// ----- GET COLUMNS (AJAX) for Edit Schema -----
+// ----- GET COLUMNS (AJAX) -----
 if ($action === 'get_columns' && isset($_GET['table'])) {
-    $tableName = trim($_GET['table']);
-    $safeTable = SQLite3::escapeString($tableName);
-    $info = $db->query("PRAGMA table_info($safeTable)");
+    $tableName = trim((string) $_GET['table']);
+    if (getDatabaseObjectType($db, $tableName) === null) {
+        http_response_code(404);
+        header('Content-Type: application/json');
+        echo '[]';
+        exit;
+    }
     $columns = [];
-    while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
+    foreach (tableInfo($db, $tableName) as $row) {
         $columns[] = [
             'name' => $row['name'],
             'type' => $row['type'],
-            'pk' => (bool)$row['pk']
+            'pk' => (bool) $row['pk'],
         ];
     }
-    header('Content-Type: application/json');
-    echo json_encode($columns);
+    header('Content-Type: application/json; charset=UTF-8');
+    echo json_encode($columns, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
 
-// ----- EXPORT TABLE AS SQL -----
-if ($action === 'export_sql' && $table) {
-    $safeTable = SQLite3::escapeString($table);
-    $createResult = $db->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='$safeTable'");
-    $createRow = $createResult->fetchArray(SQLITE3_ASSOC);
-    if (!$createRow) {
-        setFlash('error', 'Table schema not found.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+// ----- EXPORT TABLE OR VIEW AS SQL -----
+if ($action === 'export_sql' && $table !== '') {
+    $statement = $db->prepare(
+        "SELECT type, sql FROM sqlite_master WHERE name = :name AND type IN ('table','view')"
+    );
+    $statement->bindValue(':name', $table, SQLITE3_TEXT);
+    $schemaResult = $statement->execute();
+    $schema = $schemaResult->fetchArray(SQLITE3_ASSOC);
+    if (!$schema) {
+        setFlash('error', 'Schema not found.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $createSQL = $createRow['sql'] . ";\n\n";
-    $rowsResult = $db->query("SELECT * FROM $safeTable");
-    $inserts = [];
-    $cols = [];
-    $info = $db->query("PRAGMA table_info($safeTable)");
-    while ($col = $info->fetchArray(SQLITE3_ASSOC)) {
-        $cols[] = $col['name'];
-    }
-    $colList = implode(',', array_map(function($c) { return '"' . SQLite3::escapeString($c) . '"'; }, $cols));
-    while ($row = $rowsResult->fetchArray(SQLITE3_ASSOC)) {
-        $vals = [];
-        foreach ($cols as $col) {
-            $val = $row[$col];
-            if ($val === null) {
-                $vals[] = 'NULL';
-            } else {
-                $vals[] = "'" . SQLite3::escapeString($val) . "'";
-            }
+
+    $content = '-- Exported from SQLite Admin' . "\n"
+        . '-- ' . ucfirst((string) $schema['type']) . ': ' . $table . "\n"
+        . '-- Date: ' . date('Y-m-d H:i:s') . "\n\n"
+        . rtrim((string) $schema['sql'], "; \t\r\n") . ";\n\n";
+
+    if ($schema['type'] === 'table') {
+        $columnInfo = tableInfo($db, $table);
+        $columns = array_map(static function (array $column) { return (string) $column['name']; }, $columnInfo);
+        $declaredTypes = [];
+        foreach ($columnInfo as $column) {
+            $declaredTypes[(string) $column['name']] = (string) $column['type'];
         }
-        $inserts[] = "INSERT INTO \"$safeTable\" ($colList) VALUES (" . implode(',', $vals) . ");";
+        $result = $db->query('SELECT * FROM ' . quoteIdentifier($table));
+        $columnList = implode(', ', array_map('quoteIdentifier', $columns));
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $values = [];
+            foreach ($columns as $column) {
+                $values[] = sqlLiteral($row[$column], $declaredTypes[$column] ?? '');
+            }
+            $content .= 'INSERT INTO ' . quoteIdentifier($table)
+                . ' (' . $columnList . ') VALUES (' . implode(', ', $values) . ");\n";
+        }
     }
-    $sqlContent = "-- Exported from SQLite Admin\n-- Table: $table\n-- Date: " . date('Y-m-d H:i:s') . "\n\n";
-    $sqlContent .= $createSQL;
-    if (!empty($inserts)) {
-        $sqlContent .= "-- Data\n" . implode("\n", $inserts) . "\n";
-    } else {
-        $sqlContent .= "-- No data rows.\n";
-    }
-    header('Content-Type: application/sql');
-    header('Content-Disposition: attachment; filename="' . $table . '.sql"');
-    echo $sqlContent;
+
+    header('Content-Type: application/sql; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . safeDownloadName($table, 'export') . '.sql"');
+    echo $content;
     exit;
 }
 
-// ----- IMPORT DATABASE (Upload .sqlite file) -----
-if ($action === 'import_db' && isset($_FILES['db_file'])) {
-    $file = $_FILES['db_file'];
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        setFlash('error', 'File upload error: ' . $file['error']);
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+// ----- DELETE AN IMPORTED DATABASE -----
+if ($action === 'delete_db') {
+    $databaseName = basename(trim((string) ($_POST['db'] ?? '')));
+    $databasePath = $dbDir . DIRECTORY_SEPARATOR . $databaseName;
+    if (!in_array($databaseName, $databases, true) || !isDatabaseFilename($databaseName)) {
+        setFlash('error', 'Invalid database file.');
+        redirectTo('?');
     }
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    if (!in_array($ext, ['sqlite', 'db', 'sqlite3'])) {
-        setFlash('error', 'Only SQLite database files (.sqlite, .db, .sqlite3) are allowed.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+    if (realpath($databasePath) === realpath($configuredDbFile)) {
+        setFlash('error', 'The configured primary database cannot be deleted from the web interface.');
+        redirectTo('?');
     }
-    $baseName = preg_replace('/[^a-zA-Z0-9_\-]/', '_', pathinfo($file['name'], PATHINFO_FILENAME));
-    $destName = $baseName . '.' . $ext;
-    $destPath = $dbDir . '/' . $destName;
-    $counter = 1;
-    while (file_exists($destPath)) {
-        $destName = $baseName . '_' . $counter . '.' . $ext;
-        $destPath = $dbDir . '/' . $destName;
-        $counter++;
+    if ((string) ($_POST['confirm_name'] ?? '') !== $databaseName) {
+        setFlash('error', 'Database deletion was not confirmed.');
+        redirectTo('?');
     }
-    if (move_uploaded_file($file['tmp_name'], $destPath)) {
-        setFlash('success', 'Database "' . htmlspecialchars($destName) . '" imported successfully.');
-        $databases = array_merge($databases, [$destName]);
-        sort($databases);
-        $_SESSION['current_db'] = $destPath;
-        header('Location: ?db=' . urlencode($destName));
-    } else {
-        setFlash('error', 'Failed to save database file. Please check write permissions.');
-        header('Location: ' . getQueryString('', '', []));
+
+    $wasCurrent = realpath($databasePath) === realpath($dbFile);
+    if ($wasCurrent) $db->close();
+    if (!@unlink($databasePath)) {
+        setFlash('error', 'The database could not be deleted. Check file permissions.');
+        redirectTo('?');
     }
-    exit;
+    @unlink($databasePath . '-wal');
+    @unlink($databasePath . '-shm');
+    if ($wasCurrent) $_SESSION['current_db'] = $configuredDbFile;
+    setFlash('success', 'Database "' . $databaseName . '" deleted.');
+    redirectTo('?');
 }
 
-// ----- EXPORT DATABASE -----
+// ----- IMPORT DATABASE -----
+if ($action === 'import_db') {
+    $file = $_FILES['db_file'] ?? null;
+    if (!is_array($file) || (int) $file['error'] !== UPLOAD_ERR_OK) {
+        setFlash('error', 'Database upload failed.');
+        redirectTo('?');
+    }
+    if ((int) $file['size'] > 104857600) {
+        setFlash('error', 'Database files are limited to 100 MB.');
+        redirectTo('?');
+    }
+    $extension = strtolower(pathinfo((string) $file['name'], PATHINFO_EXTENSION));
+    if (!in_array($extension, ['sqlite', 'db', 'sqlite3'], true)) {
+        setFlash('error', 'Only .sqlite, .db, and .sqlite3 files are allowed.');
+        redirectTo('?');
+    }
+    $handle = fopen((string) $file['tmp_name'], 'rb');
+    $header = $handle ? fread($handle, 16) : false;
+    if (is_resource($handle)) fclose($handle);
+    if ($header !== "SQLite format 3\x00") {
+        setFlash('error', 'The uploaded file is not a valid SQLite database.');
+        redirectTo('?');
+    }
+
+    $base = preg_replace('/[^A-Za-z0-9_-]+/', '_', pathinfo((string) $file['name'], PATHINFO_FILENAME)) ?: 'database';
+    $destinationName = $base . '.' . $extension;
+    $destinationPath = $dbDir . DIRECTORY_SEPARATOR . $destinationName;
+    for ($counter = 1; is_file($destinationPath); $counter++) {
+        $destinationName = $base . '_' . $counter . '.' . $extension;
+        $destinationPath = $dbDir . DIRECTORY_SEPARATOR . $destinationName;
+    }
+
+    if (!move_uploaded_file((string) $file['tmp_name'], $destinationPath)) {
+        setFlash('error', 'The uploaded database could not be saved.');
+        redirectTo('?');
+    }
+    try {
+        $testDb = new SQLite3($destinationPath, SQLITE3_OPEN_READONLY);
+        $testDb->enableExceptions(true);
+        $integrity = (string) $testDb->querySingle('PRAGMA integrity_check');
+        $testDb->close();
+        if ($integrity !== 'ok') throw new RuntimeException('Integrity check failed.');
+    } catch (Throwable $exception) {
+        @unlink($destinationPath);
+        setFlash('error', 'The uploaded database failed validation: ' . $exception->getMessage());
+        redirectTo('?');
+    }
+
+    $_SESSION['current_db'] = $destinationPath;
+    setFlash('success', 'Database "' . $destinationName . '" imported.');
+    redirectTo('?db=' . urlencode($destinationName));
+}
+
+// ----- EXPORT DATABASE AS A CONSISTENT SNAPSHOT -----
 if ($action === 'export_db') {
-    if (!file_exists($dbFile)) {
-        setFlash('error', 'Database file not found.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+    $temporary = tempnam(sys_get_temp_dir(), 'sqlite-admin-');
+    if ($temporary === false) {
+        http_response_code(500);
+        exit('A temporary export file could not be created.');
     }
-    $fileName = basename($dbFile);
-    header('Content-Type: application/octet-stream');
-    header('Content-Disposition: attachment; filename="' . $fileName . '"');
-    header('Content-Length: ' . filesize($dbFile));
-    readfile($dbFile);
+    try {
+        createDatabaseSnapshot($db, $dbFile, $temporary);
+        $downloadName = safeDownloadName(basename($dbFile), 'database.sqlite');
+        header('Content-Type: application/vnd.sqlite3');
+        header('Content-Disposition: attachment; filename="' . $downloadName . '"');
+        header('Content-Length: ' . filesize($temporary));
+        readfile($temporary);
+    } finally {
+        @unlink($temporary);
+    }
     exit;
 }
 
 // ----- DROP TABLE -----
-if ($action === 'drop_table' && isset($_GET['table'])) {
-    $tableName = trim($_GET['table']);
-    if (empty($tableName)) {
-        setFlash('error', 'Table name is required.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+if ($action === 'drop_table') {
+    $tableName = trim((string) ($_POST['table'] ?? ''));
+    if (getDatabaseObjectType($db, $tableName) !== 'table') {
+        setFlash('error', 'Table not found.');
+        redirectTo('?');
     }
-    $safeTable = SQLite3::escapeString($tableName);
     try {
-        $db->exec("DROP TABLE $safeTable");
-        setFlash('success', 'Table "' . htmlspecialchars($tableName) . '" dropped successfully.');
-        header('Location: ' . getQueryString('', '', []));
-    } catch (Exception $e) {
-        setFlash('error', 'Failed to drop table: ' . $e->getMessage());
-        header('Location: ' . getQueryString('', '', []));
+        $db->exec('DROP TABLE ' . quoteIdentifier($tableName));
+        setFlash('success', 'Table "' . $tableName . '" dropped.');
+    } catch (Throwable $exception) {
+        setFlash('error', 'Failed to drop table: ' . $exception->getMessage());
     }
-    exit;
+    redirectTo('?');
 }
 
 // ----- RENAME TABLE -----
-if ($action === 'rename_table' && isset($_POST['old_name']) && isset($_POST['new_name'])) {
-    $oldName = trim($_POST['old_name']);
-    $newName = trim($_POST['new_name']);
-    if (empty($oldName) || empty($newName)) {
-        setFlash('error', 'Table names are required.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+if ($action === 'rename_table') {
+    $oldName = trim((string) ($_POST['old_name'] ?? ''));
+    $newName = trim((string) ($_POST['new_name'] ?? ''));
+    if (getDatabaseObjectType($db, $oldName) !== 'table'
+        || !preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $newName)) {
+        setFlash('error', 'Enter a valid table name.');
+        redirectTo('?');
     }
-    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $newName)) {
-        setFlash('error', 'Invalid table name. Use only letters, numbers, and underscores, starting with a letter or underscore.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $safeOld = SQLite3::escapeString($oldName);
-    $safeNew = SQLite3::escapeString($newName);
     try {
-        $db->exec("ALTER TABLE $safeOld RENAME TO $safeNew");
+        $db->exec('ALTER TABLE ' . quoteIdentifier($oldName) . ' RENAME TO ' . quoteIdentifier($newName));
         pushHistory('rename_table', $newName, ['old_name' => $oldName]);
-        setFlash('success', 'Table renamed to "' . htmlspecialchars($newName) . '".');
-        header('Location: ' . getQueryString($newName, $search, $colFilters));
-    } catch (Exception $e) {
-        setFlash('error', 'Failed to rename table: ' . $e->getMessage());
-        header('Location: ' . getQueryString('', '', []));
+        setFlash('success', 'Table renamed to "' . $newName . '".');
+        redirectTo(getQueryString($newName, $search, $colFilters));
+    } catch (Throwable $exception) {
+        setFlash('error', 'Failed to rename table: ' . $exception->getMessage());
+        redirectTo('?');
     }
-    exit;
 }
 
 // ----- ADD COLUMN -----
-if ($action === 'add_column' && isset($_POST['table']) && isset($_POST['col_name']) && isset($_POST['col_type'])) {
-    $tableName = trim($_POST['table']);
-    $colName = trim($_POST['col_name']);
-    $colType = strtoupper(trim($_POST['col_type']));
-    if (empty($tableName) || empty($colName)) {
-        setFlash('error', 'Table name and column name are required.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+if ($action === 'add_column') {
+    $tableName = trim((string) ($_POST['table'] ?? ''));
+    $columnName = trim((string) ($_POST['col_name'] ?? ''));
+    $columnType = strtoupper(trim((string) ($_POST['col_type'] ?? 'TEXT')));
+    $allowedTypes = ['TEXT', 'INTEGER', 'REAL', 'NUMERIC', 'BLOB'];
+    if (getDatabaseObjectType($db, $tableName) !== 'table'
+        || !preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $columnName)
+        || !in_array($columnType, $allowedTypes, true)) {
+        setFlash('error', 'Invalid table, column name, or column type.');
+        redirectTo(getQueryString($tableName, $search, $colFilters));
     }
-    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $colName)) {
-        setFlash('error', 'Invalid column name.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $allowedTypes = ['TEXT', 'INTEGER', 'REAL', 'NUMERIC', 'BLOB', 'NULL'];
-    if (!in_array($colType, $allowedTypes)) {
-        setFlash('error', 'Invalid column type.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $safeTable = SQLite3::escapeString($tableName);
-    $safeCol = SQLite3::escapeString($colName);
     try {
-        $db->exec("ALTER TABLE $safeTable ADD COLUMN $safeCol $colType");
-        pushHistory('add_column', $tableName, ['col_name' => $colName]);
-        setFlash('success', 'Column "' . htmlspecialchars($colName) . '" added to table "' . htmlspecialchars($tableName) . '".');
-        header('Location: ' . getQueryString($tableName, $search, $colFilters));
-    } catch (Exception $e) {
-        setFlash('error', 'Failed to add column: ' . $e->getMessage());
-        header('Location: ' . getQueryString($tableName, $search, $colFilters));
+        $db->exec(
+            'ALTER TABLE ' . quoteIdentifier($tableName)
+            . ' ADD COLUMN ' . quoteIdentifier($columnName) . ' ' . $columnType
+        );
+        pushHistory('add_column', $tableName, ['col_name' => $columnName]);
+        setFlash('success', 'Column "' . $columnName . '" added.');
+    } catch (Throwable $exception) {
+        setFlash('error', 'Failed to add column: ' . $exception->getMessage());
     }
-    exit;
+    redirectTo(getQueryString($tableName, $search, $colFilters));
 }
 
 // ----- RENAME COLUMN -----
-if ($action === 'rename_column' && isset($_POST['table']) && isset($_POST['old_col']) && isset($_POST['new_col'])) {
-    $tableName = trim($_POST['table']);
-    $oldCol = trim($_POST['old_col']);
-    $newCol = trim($_POST['new_col']);
-    if (empty($tableName) || empty($oldCol) || empty($newCol)) {
-        setFlash('error', 'All fields are required.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+if ($action === 'rename_column') {
+    $tableName = trim((string) ($_POST['table'] ?? ''));
+    $oldColumn = trim((string) ($_POST['old_col'] ?? ''));
+    $newColumn = trim((string) ($_POST['new_col'] ?? ''));
+    $columnNames = array_map(static function (array $column) { return (string) $column['name']; }, tableInfo($db, $tableName));
+    if (getDatabaseObjectType($db, $tableName) !== 'table'
+        || !in_array($oldColumn, $columnNames, true)
+        || !preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $newColumn)) {
+        setFlash('error', 'Invalid table or column name.');
+        redirectTo(getQueryString($tableName, $search, $colFilters));
     }
-    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $newCol)) {
-        setFlash('error', 'Invalid column name.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $safeTable = SQLite3::escapeString($tableName);
-    $safeOld = SQLite3::escapeString($oldCol);
-    $safeNew = SQLite3::escapeString($newCol);
     try {
-        $db->exec("ALTER TABLE $safeTable RENAME COLUMN $safeOld TO $safeNew");
-        pushHistory('rename_column', $tableName, ['old_col' => $oldCol, 'new_col' => $newCol]);
-        setFlash('success', 'Column renamed to "' . htmlspecialchars($newCol) . '".');
-        header('Location: ' . getQueryString($tableName, $search, $colFilters));
-    } catch (Exception $e) {
-        setFlash('error', 'Failed to rename column: ' . $e->getMessage());
-        header('Location: ' . getQueryString($tableName, $search, $colFilters));
+        $db->exec(
+            'ALTER TABLE ' . quoteIdentifier($tableName)
+            . ' RENAME COLUMN ' . quoteIdentifier($oldColumn)
+            . ' TO ' . quoteIdentifier($newColumn)
+        );
+        pushHistory('rename_column', $tableName, ['old_col' => $oldColumn, 'new_col' => $newColumn]);
+        setFlash('success', 'Column renamed to "' . $newColumn . '".');
+    } catch (Throwable $exception) {
+        setFlash('error', 'Failed to rename column: ' . $exception->getMessage());
     }
-    exit;
+    redirectTo(getQueryString($tableName, $search, $colFilters));
 }
 
 // ----- CREATE TABLE -----
-if ($action === 'create_table' && isset($_POST['table_name']) && isset($_POST['col_name'])) {
-    $tableName = trim($_POST['table_name']);
-    $colNames = $_POST['col_name'];
-    $colTypes = $_POST['col_type'];
-    $colPk = isset($_POST['col_pk']) ? $_POST['col_pk'] : [];
-    
-    if (empty($tableName)) {
-        setFlash('error', 'Table name is required.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+if ($action === 'create_table') {
+    $tableName = trim((string) ($_POST['table_name'] ?? ''));
+    $columnNames = is_array($_POST['col_name'] ?? null) ? $_POST['col_name'] : [];
+    $columnTypes = is_array($_POST['col_type'] ?? null) ? $_POST['col_type'] : [];
+    $primaryKeyIndex = isset($_POST['primary_key_index']) ? (int) $_POST['primary_key_index'] : -1;
+    if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $tableName)
+        || getDatabaseObjectType($db, $tableName) !== null) {
+        setFlash('error', 'Enter a unique, valid table name.');
+        redirectTo('?');
     }
-    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $tableName)) {
-        setFlash('error', 'Invalid table name.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $check = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name='" . SQLite3::escapeString($tableName) . "'");
-    if ($check->fetchArray(SQLITE3_ASSOC)) {
-        setFlash('error', 'Table "' . htmlspecialchars($tableName) . '" already exists.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
-    }
-    $safeTable = SQLite3::escapeString($tableName);
-    $colDefs = [];
-    $hasPk = false;
-    foreach ($colNames as $idx => $colName) {
-        $colName = trim($colName);
-        $colType = strtoupper(trim($colTypes[$idx] ?? 'TEXT'));
-        $isPk = isset($colPk[$idx]) && $colPk[$idx] == '1';
-        if (empty($colName)) continue;
-        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $colName)) {
-            setFlash('error', 'Invalid column name: ' . htmlspecialchars($colName));
-            header('Location: ' . getQueryString('', '', []));
-            exit;
+
+    $definitions = [];
+    $hasPrimaryKey = false;
+    $allowedTypes = ['TEXT', 'INTEGER', 'REAL', 'NUMERIC', 'BLOB'];
+    foreach ($columnNames as $index => $rawName) {
+        $name = trim((string) $rawName);
+        $type = strtoupper(trim((string) ($columnTypes[$index] ?? 'TEXT')));
+        if ($name === '') continue;
+        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) || !in_array($type, $allowedTypes, true)) {
+            setFlash('error', 'Invalid column definition: ' . $name);
+            redirectTo('?');
         }
-        $allowedTypes = ['TEXT', 'INTEGER', 'REAL', 'NUMERIC', 'BLOB', 'NULL'];
-        if (!in_array($colType, $allowedTypes)) {
-            setFlash('error', 'Invalid column type: ' . htmlspecialchars($colType));
-            header('Location: ' . getQueryString('', '', []));
-            exit;
-        }
-        $colDef = SQLite3::escapeString($colName) . ' ' . $colType;
-        if ($isPk) {
-            if ($hasPk) {
-                setFlash('error', 'Only one primary key allowed.');
-                header('Location: ' . getQueryString('', '', []));
-                exit;
+        $definition = quoteIdentifier($name) . ' ' . $type;
+        if ($index === $primaryKeyIndex) {
+            if ($hasPrimaryKey) {
+                setFlash('error', 'The visual table creator supports one primary key.');
+                redirectTo('?');
             }
-            $hasPk = true;
-            $colDef .= ' PRIMARY KEY';
+            $definition .= ' PRIMARY KEY';
+            $hasPrimaryKey = true;
         }
-        $colDefs[] = $colDef;
+        $definitions[] = $definition;
     }
-    if (empty($colDefs)) {
-        setFlash('error', 'No valid columns provided.');
-        header('Location: ' . getQueryString('', '', []));
-        exit;
+    if ($definitions === []) {
+        setFlash('error', 'Add at least one column.');
+        redirectTo('?');
     }
-    $sql = "CREATE TABLE $safeTable (\n  " . implode(",\n  ", $colDefs) . "\n)";
     try {
-        if ($db->exec($sql)) {
-            setFlash('success', 'Table "' . htmlspecialchars($tableName) . '" created successfully.');
-            header('Location: ?table=' . urlencode($tableName));
-        } else {
-            setFlash('error', 'Failed to create table: ' . $db->lastErrorMsg());
-            header('Location: ' . getQueryString('', '', []));
-        }
-    } catch (Exception $e) {
-        setFlash('error', 'Failed to create table: ' . $e->getMessage());
-        header('Location: ' . getQueryString('', '', []));
+        $db->exec(
+            'CREATE TABLE ' . quoteIdentifier($tableName)
+            . ' (' . implode(', ', $definitions) . ')'
+        );
+        setFlash('success', 'Table "' . $tableName . '" created.');
+        redirectTo(getQueryString($tableName, '', []));
+    } catch (Throwable $exception) {
+        setFlash('error', 'Failed to create table: ' . $exception->getMessage());
+        redirectTo('?');
     }
-    exit;
 }
 
-// ----- EXPORT TABLE (CSV/JSON) -----
-if ($action === 'export_table' && $table) {
-    $format = isset($_GET['format']) ? $_GET['format'] : 'csv';
-    $safeTable = SQLite3::escapeString($table);
-    $result = $db->query("SELECT * FROM $safeTable");
-    $rows = [];
-    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-        $rows[] = $row;
+// ----- EXPORT TABLE / VIEW (CSV OR JSON) -----
+if ($action === 'export_table' && $table !== '') {
+    $format = strtolower((string) ($_GET['format'] ?? 'csv'));
+    if (!in_array($format, ['csv', 'json'], true)) {
+        http_response_code(400);
+        exit('Unsupported export format.');
     }
-    if (empty($rows)) {
-        setFlash('error', 'Table is empty, nothing to export.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+    $exportColumnInfo = tableInfo($db, $table);
+    $columns = array_map(static function (array $column) { return (string) $column['name']; }, $exportColumnInfo);
+    $exportTypes = [];
+    foreach ($exportColumnInfo as $column) {
+        $exportTypes[(string) $column['name']] = (string) $column['type'];
     }
-    $cols = array_keys($rows[0]);
+    $parameters = [];
+    $where = buildWhere($columns, $search, $colFilters, $parameters);
+    $result = queryWithTextParameters(
+        $db,
+        'SELECT * FROM ' . quoteIdentifier($table) . $where,
+        $parameters
+    );
+
+    $downloadBase = safeDownloadName($table, 'table');
     if ($format === 'csv') {
-        header('Content-Type: text/csv');
-        header('Content-Disposition: attachment; filename="' . $table . '.csv"');
-        $output = fopen('php://output', 'w');
-        fputcsv($output, $cols);
-        foreach ($rows as $row) {
-            fputcsv($output, array_values($row));
+        header('Content-Type: text/csv; charset=UTF-8');
+        header('Content-Disposition: attachment; filename="' . $downloadBase . '.csv"');
+        $output = fopen('php://output', 'wb');
+        fputcsv($output, $columns);
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $csvRow = [];
+            foreach ($columns as $column) {
+                $csvRow[] = encodePortableValue(
+                    $row[$column] ?? null,
+                    $exportTypes[$column] ?? '',
+                    true
+                );
+            }
+            fputcsv($output, $csvRow);
         }
         fclose($output);
-        exit;
-    } elseif ($format === 'json') {
-        header('Content-Type: application/json');
-        header('Content-Disposition: attachment; filename="' . $table . '.json"');
-        echo json_encode($rows, JSON_PRETTY_PRINT);
-        exit;
     } else {
-        setFlash('error', 'Unsupported export format.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+        $rows = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $portableRow = [];
+            foreach ($columns as $column) {
+                $portableRow[$column] = encodePortableValue(
+                    $row[$column] ?? null,
+                    $exportTypes[$column] ?? ''
+                );
+            }
+            $rows[] = $portableRow;
+        }
+        header('Content-Type: application/json; charset=UTF-8');
+        header('Content-Disposition: attachment; filename="' . $downloadBase . '.json"');
+        echo jsonEncodeChecked(
+            $rows,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
     }
+    exit;
 }
 
-// ----- IMPORT TABLE (CSV/JSON) -----
-if ($action === 'import_table' && $table && isset($_FILES['import_file'])) {
-    $file = $_FILES['import_file'];
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        setFlash('error', 'File upload error: ' . $file['error']);
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+// ----- IMPORT TABLE (CSV OR JSON) -----
+if ($action === 'import_table' && $table !== '') {
+    $file = $_FILES['import_file'] ?? null;
+    if (!is_array($file) || (int) $file['error'] !== UPLOAD_ERR_OK) {
+        setFlash('error', 'Table import failed.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    if (!in_array($ext, ['csv', 'json'])) {
-        setFlash('error', 'Only CSV and JSON files are allowed.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+    if ((int) ($file['size'] ?? 0) > 26214400) {
+        setFlash('error', 'Table import files are limited to 25 MB.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $content = file_get_contents($file['tmp_name']);
-    if ($content === false) {
-        setFlash('error', 'Failed to read uploaded file.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+    $extension = strtolower(pathinfo((string) $file['name'], PATHINFO_EXTENSION));
+    if (!in_array($extension, ['csv', 'json'], true)) {
+        setFlash('error', 'Only CSV and JSON files are supported.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $cols = [];
-    $info = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
-        $cols[] = $row['name'];
+
+    $importColumnInfo = tableInfo($db, $table);
+    $tableColumns = array_map(static function (array $column) { return (string) $column['name']; }, $importColumnInfo);
+    $importTypes = [];
+    foreach ($importColumnInfo as $column) {
+        $importTypes[(string) $column['name']] = (string) $column['type'];
     }
-    if (empty($cols)) {
-        setFlash('error', 'Table has no columns.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
-    }
-    $safeTable = SQLite3::escapeString($table);
-    $inserted = 0;
-    $errors = 0;
-    if ($ext === 'csv') {
-        $lines = explode("\n", trim($content));
-        if (count($lines) < 2) {
-            setFlash('error', 'CSV must have a header row and at least one data row.');
-            header('Location: ' . getQueryString($table, $search, $colFilters));
-            exit;
-        }
-        $header = str_getcsv(array_shift($lines));
-        $headerMap = [];
-        foreach ($header as $h) {
-            $h = trim($h);
-            foreach ($cols as $col) {
-                if (strcasecmp($h, $col) === 0) {
-                    $headerMap[$h] = $col;
-                    break;
+    $rows = [];
+    try {
+        if ($extension === 'csv') {
+            $handle = fopen((string) $file['tmp_name'], 'rb');
+            if (!$handle) throw new RuntimeException('The CSV file could not be read.');
+            $header = fgetcsv($handle);
+            if (!is_array($header) || $header === []) throw new RuntimeException('CSV header row is missing.');
+            $header = array_map(static function ($value) { return trim((string) $value); }, $header);
+            if (isset($header[0])) $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', $header[0]) ?? $header[0];
+            if (count(array_unique($header)) !== count($header)) {
+                throw new RuntimeException('CSV column names must be unique.');
+            }
+            foreach ($header as $column) {
+                if (!in_array($column, $tableColumns, true)) {
+                    throw new RuntimeException('Unknown CSV column: ' . $column);
                 }
             }
-        }
-        if (count($headerMap) !== count($header)) {
-            setFlash('error', 'CSV header does not match table columns.');
-            header('Location: ' . getQueryString($table, $search, $colFilters));
-            exit;
-        }
-        foreach ($lines as $line) {
-            if (trim($line) === '') continue;
-            $data = str_getcsv($line);
-            if (count($data) !== count($header)) {
-                $errors++;
-                continue;
+            while (($values = fgetcsv($handle)) !== false) {
+                if (count($values) !== count($header)) continue;
+                $csvRow = array_combine($header, $values);
+                if (!is_array($csvRow)) continue;
+                foreach ($csvRow as $column => $value) {
+                    $csvRow[$column] = decodePortableValue(
+                        $value,
+                        $importTypes[(string) $column] ?? '',
+                        true
+                    );
+                }
+                $rows[] = $csvRow;
             }
-            $values = [];
-            foreach ($header as $idx => $h) {
-                $col = $headerMap[$h];
-                $values[] = "'" . SQLite3::escapeString($data[$idx]) . "'";
+            fclose($handle);
+        } else {
+            $decoded = jsonDecodeChecked(file_get_contents((string) $file['tmp_name']), true);
+            if (!is_array($decoded) || !isListArray($decoded)) {
+                throw new RuntimeException('JSON must contain a top-level array of objects.');
             }
-            $colNames = array_map(function($c) { return SQLite3::escapeString($c); }, array_values($headerMap));
-            $sql = "INSERT INTO $safeTable (" . implode(',', $colNames) . ") VALUES (" . implode(',', $values) . ")";
+            foreach ($decoded as $row) {
+                if (!is_array($row)) continue;
+                $clean = [];
+                foreach ($row as $column => $value) {
+                    if (!in_array((string) $column, $tableColumns, true)) continue;
+                    if (is_array($value) || is_object($value)) {
+                        $value = jsonEncodeChecked(
+                            $value,
+                            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+                        );
+                    }
+                    $clean[(string) $column] = decodePortableValue(
+                        $value,
+                        $importTypes[(string) $column] ?? ''
+                    );
+                }
+                if ($clean !== []) $rows[] = $clean;
+            }
+        }
+
+        if ($rows === []) {
+            throw new RuntimeException('The import file contains no usable rows.');
+        }
+
+        $inserted = 0;
+        $errors = 0;
+        $db->exec('BEGIN IMMEDIATE');
+        foreach ($rows as $row) {
             try {
-                if ($db->exec($sql)) $inserted++;
-                else $errors++;
-            } catch (Exception $e) {
+                insertAssocRow($db, $table, $row);
+                $inserted++;
+            } catch (Throwable $ignoredException) {
                 $errors++;
             }
         }
-    } elseif ($ext === 'json') {
-        $data = json_decode($content, true);
-        if (!is_array($data) || empty($data)) {
-            setFlash('error', 'Invalid JSON format or empty array.');
-            header('Location: ' . getQueryString($table, $search, $colFilters));
-            exit;
-        }
-        $first = $data[0];
-        if (!is_array($first)) {
-            setFlash('error', 'JSON must be an array of objects.');
-            header('Location: ' . getQueryString($table, $search, $colFilters));
-            exit;
-        }
-        $jsonKeys = array_keys($first);
-        $validCols = array_intersect($jsonKeys, $cols);
-        if (empty($validCols)) {
-            setFlash('error', 'JSON keys do not match any table columns.');
-            header('Location: ' . getQueryString($table, $search, $colFilters));
-            exit;
-        }
-        foreach ($data as $row) {
-            $values = [];
-            $colNames = [];
-            foreach ($row as $key => $val) {
-                if (in_array($key, $cols)) {
-                    $colNames[] = SQLite3::escapeString($key);
-                    $values[] = "'" . SQLite3::escapeString($val) . "'";
-                }
-            }
-            if (!empty($colNames)) {
-                $sql = "INSERT INTO $safeTable (" . implode(',', $colNames) . ") VALUES (" . implode(',', $values) . ")";
-                try {
-                    if ($db->exec($sql)) $inserted++;
-                    else $errors++;
-                } catch (Exception $e) {
-                    $errors++;
-                }
-            } else {
-                $errors++;
-            }
-        }
+        $db->exec('COMMIT');
+        setFlash('success', "Import completed: $inserted inserted, $errors skipped.");
+    } catch (Throwable $exception) {
+        try { $db->exec('ROLLBACK'); } catch (Throwable $ignoredException) {}
+        setFlash('error', 'Import failed: ' . $exception->getMessage());
     }
-    setFlash('success', "Import completed: $inserted rows inserted, $errors errors.");
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- BULK DELETE -----
-if ($action === 'bulk_delete' && $table && isset($_POST['selected'])) {
-    $pkCol = null;
-    $info = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
-        if ($row['pk']) { $pkCol = $row['name']; break; }
+if ($action === 'bulk_delete' && $table !== '') {
+    $selected = is_array($_POST['selected'] ?? null) ? array_values(array_unique($_POST['selected'])) : [];
+    $locator = tableLocator($db, $table);
+    if ($selected === [] || empty($locator['column'])) {
+        setFlash('error', $selected === [] ? 'No rows selected.' : 'This table has no editable row identifier.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $useRowid = false;
-    if ($pkCol === null) {
-        $pkCol = 'rowid';
-        $useRowid = true;
-    }
-    $safeTable = SQLite3::escapeString($table);
-    $ids = array_map(function($id) use ($db) {
-        return "'" . SQLite3::escapeString($id) . "'";
-    }, $_POST['selected']);
-    if (!empty($ids)) {
-        $rowsToDelete = [];
-        if ($useRowid) {
-            $result = $db->query("SELECT * FROM $safeTable WHERE rowid IN (" . implode(',', $ids) . ")");
-        } else {
-            $safePk = SQLite3::escapeString($pkCol);
-            $result = $db->query("SELECT * FROM $safeTable WHERE $safePk IN (" . implode(',', $ids) . ")");
-        }
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $rowsToDelete[] = $row;
-        }
-        try {
-            if ($useRowid) {
-                $db->exec("DELETE FROM $safeTable WHERE rowid IN (" . implode(',', $ids) . ")");
-            } else {
-                $safePk = SQLite3::escapeString($pkCol);
-                $db->exec("DELETE FROM $safeTable WHERE $safePk IN (" . implode(',', $ids) . ")");
+    $rows = [];
+    try {
+        $db->exec('BEGIN IMMEDIATE');
+        foreach ($selected as $value) {
+            $row = fetchRowByLocator($db, $table, $locator, $value);
+            if ($row !== null) {
+                $rows[] = $row;
+                deleteByLocator($db, $table, $locator, $value);
             }
-            pushHistory('bulk_delete', $table, ['rows' => $rowsToDelete]);
-            setFlash('success', count($_POST['selected']) . ' rows deleted successfully.');
-        } catch (Exception $e) {
-            setFlash('error', 'Failed to delete rows: ' . $e->getMessage());
         }
-    } else {
-        setFlash('error', 'No rows selected for deletion.');
+        $db->exec('COMMIT');
+        pushHistory('bulk_delete', $table, ['rows' => $rows]);
+        setFlash('success', count($rows) . ' rows deleted.');
+    } catch (Throwable $exception) {
+        try { $db->exec('ROLLBACK'); } catch (Throwable $ignoredException) {}
+        setFlash('error', 'Bulk delete failed: ' . $exception->getMessage());
     }
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- DELETE SINGLE ROW -----
-if ($action === 'delete' && $table && isset($_GET['pk'])) {
-    $pkCol = null;
-    $info = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
-        if ($row['pk']) { $pkCol = $row['name']; break; }
-    }
-    $useRowid = false;
-    if ($pkCol === null) {
-        $pkCol = 'rowid';
-        $useRowid = true;
-    }
-    $safeTable = SQLite3::escapeString($table);
-    $safeVal = SQLite3::escapeString($_GET['pk']);
-    if ($useRowid) {
-        $result = $db->query("SELECT * FROM $safeTable WHERE rowid = '$safeVal'");
-    } else {
-        $safePk = SQLite3::escapeString($pkCol);
-        $result = $db->query("SELECT * FROM $safeTable WHERE $safePk = '$safeVal'");
-    }
-    $rowData = $result->fetchArray(SQLITE3_ASSOC);
-    if ($rowData) {
-        try {
-            if ($useRowid) {
-                $db->exec("DELETE FROM $safeTable WHERE rowid = '$safeVal'");
-            } else {
-                $safePk = SQLite3::escapeString($pkCol);
-                $db->exec("DELETE FROM $safeTable WHERE $safePk = '$safeVal'");
-            }
-            pushHistory('delete', $table, ['row_data' => $rowData]);
-            setFlash('success', 'Row deleted successfully.');
-        } catch (Exception $e) {
-            setFlash('error', 'Failed to delete row: ' . $e->getMessage());
-        }
-    } else {
+if ($action === 'delete' && $table !== '') {
+    $locator = tableLocator($db, $table);
+    $value = $_POST['pk'] ?? null;
+    $row = $value !== null ? fetchRowByLocator($db, $table, $locator, $value) : null;
+    if ($row === null) {
         setFlash('error', 'Row not found.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+    try {
+        deleteByLocator($db, $table, $locator, $value);
+        pushHistory('delete', $table, ['row_data' => $row]);
+        setFlash('success', 'Row deleted.');
+    } catch (Throwable $exception) {
+        setFlash('error', 'Delete failed: ' . $exception->getMessage());
+    }
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- UPDATE ROW -----
-if ($action === 'update' && $table && isset($_POST['pk'])) {
-    $pkCol = null;
-    $info = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
-        if ($row['pk']) { $pkCol = $row['name']; break; }
+if ($action === 'update' && $table !== '') {
+    $locator = tableLocator($db, $table);
+    $locatorValue = $_POST['pk'] ?? null;
+    $oldData = $locatorValue !== null ? fetchRowByLocator($db, $table, $locator, $locatorValue) : null;
+    if ($oldData === null || empty($locator['column'])) {
+        setFlash('error', 'Row not found or not editable.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $useRowid = false;
-    if ($pkCol === null) {
-        $pkCol = 'rowid';
-        $useRowid = true;
+
+    $nullFields = is_array($_POST['null_fields'] ?? null) ? $_POST['null_fields'] : [];
+    $assignments = [];
+    $values = [];
+    foreach (tableInfo($db, $table) as $column) {
+        $name = (string) $column['name'];
+        if (str_contains(strtoupper((string) $column['type']), 'BLOB')) continue;
+        if (empty($locator['rowid']) && $name === $locator['column']) continue;
+        $placeholder = ':v' . count($values);
+        $assignments[] = quoteIdentifier($name) . ' = ' . $placeholder;
+        $values[] = [
+            'placeholder' => $placeholder,
+            'value' => in_array($name, $nullFields, true) ? null : ($_POST[$name] ?? ''),
+            'type' => (string) $column['type'],
+        ];
     }
-    $safeTable = SQLite3::escapeString($table);
-    $safePkVal = SQLite3::escapeString($_POST['pk']);
-    if ($useRowid) {
-        $result = $db->query("SELECT * FROM $safeTable WHERE rowid = '$safePkVal'");
-    } else {
-        $safePk = SQLite3::escapeString($pkCol);
-        $result = $db->query("SELECT * FROM $safeTable WHERE $safePk = '$safePkVal'");
+
+    if ($assignments === []) {
+        setFlash('error', 'This row has no visual-editor fields that can be changed.');
+        redirectTo(getQueryString($table, $search, $colFilters));
     }
-    $oldData = $result->fetchArray(SQLITE3_ASSOC);
-    if (!$oldData) {
-        setFlash('error', 'Row not found.');
-        header('Location: ' . getQueryString($table, $search, $colFilters));
-        exit;
+
+    try {
+        $locatorSql = !empty($locator['rowid']) ? 'rowid' : quoteIdentifier((string) $locator['column']);
+        $statement = $db->prepare(
+            'UPDATE ' . quoteIdentifier($table) . ' SET ' . implode(', ', $assignments)
+            . ' WHERE ' . $locatorSql . ' = :locator'
+        );
+        foreach ($values as $item) bindTyped($statement, $item['placeholder'], $item['value'], $item['type']);
+        bindTyped($statement, ':locator', $locatorValue, (string) ($locator['type'] ?? ''));
+        $statement->execute();
+        pushHistory('update', $table, [
+            'locator' => $locator,
+            'locator_value' => $locatorValue,
+            'old_data' => $oldData,
+        ]);
+        setFlash('success', 'Row updated.');
+    } catch (Throwable $exception) {
+        setFlash('error', 'Update failed: ' . $exception->getMessage());
     }
-    $cols = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    $set = [];
-    $hasChanges = false;
-    while ($col = $cols->fetchArray(SQLITE3_ASSOC)) {
-        $name = $col['name'];
-        if (!$useRowid && $name === $pkCol) continue;
-        $safeName = SQLite3::escapeString($name);
-        $safeVal = SQLite3::escapeString($_POST[$name] ?? '');
-        $set[] = "$safeName = '$safeVal'";
-        $hasChanges = true;
-    }
-    if ($set && $hasChanges) {
-        try {
-            if ($useRowid) {
-                $db->exec("UPDATE $safeTable SET " . implode(', ', $set) . " WHERE rowid = '$safePkVal'");
-            } else {
-                $safePk = SQLite3::escapeString($pkCol);
-                $db->exec("UPDATE $safeTable SET " . implode(', ', $set) . " WHERE $safePk = '$safePkVal'");
-            }
-            pushHistory('update', $table, ['pk_col' => $pkCol, 'pk_val' => $_POST['pk'], 'old_data' => $oldData]);
-            setFlash('success', 'Row updated successfully.');
-        } catch (Exception $e) {
-            setFlash('error', 'Failed to update row: ' . $e->getMessage());
-        }
-    } else {
-        setFlash('error', 'No changes made or invalid data.');
-    }
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- INSERT ROW -----
-if ($action === 'insert' && $table && isset($_POST['new'])) {
-    $safeTable = SQLite3::escapeString($table);
-    $cols = $db->query("PRAGMA table_info(" . SQLite3::escapeString($table) . ")");
-    $colNames = [];
-    $colValues = [];
-    $pkCol = null;
-    while ($col = $cols->fetchArray(SQLITE3_ASSOC)) {
-        $name = $col['name'];
-        $colNames[] = SQLite3::escapeString($name);
-        $colValues[] = "'" . SQLite3::escapeString($_POST[$name] ?? '') . "'";
-        if ($col['pk']) $pkCol = $name;
-    }
-    if (!empty($colNames)) {
-        $sql = "INSERT INTO $safeTable (" . implode(', ', $colNames) . ") VALUES (" . implode(', ', $colValues) . ")";
-        try {
-            $db->exec($sql);
-            $pkVal = null;
-            if ($pkCol) {
-                $lastId = $db->lastInsertRowID();
-                $pkVal = $db->querySingle("SELECT $pkCol FROM $safeTable WHERE rowid = $lastId");
-            }
-            pushHistory('insert', $table, ['pk_col' => $pkCol, 'pk_val' => $pkVal]);
-            setFlash('success', 'New row inserted successfully.');
-        } catch (SQLite3Exception $e) {
-            if (strpos($e->getMessage(), 'UNIQUE constraint failed') !== false) {
-                setFlash('error', 'Insert failed: A row with this primary key already exists.');
-            } else {
-                setFlash('error', 'Insert failed: ' . $e->getMessage());
-            }
-        } catch (Exception $e) {
-            setFlash('error', 'Insert failed: ' . $e->getMessage());
+if ($action === 'insert' && $table !== '' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    requireCsrf();
+    $nullFields = is_array($_POST['null_fields'] ?? null) ? $_POST['null_fields'] : [];
+    $columns = [];
+    $values = [];
+    $primaryKey = null;
+    foreach (tableInfo($db, $table) as $column) {
+        $name = (string) $column['name'];
+        if (str_contains(strtoupper((string) $column['type']), 'BLOB')) continue;
+        if ((int) $column['pk'] > 0 && $primaryKey === null) $primaryKey = $name;
+        $submitted = $_POST[$name] ?? '';
+        if ((int) $column['pk'] > 0
+            && str_contains(strtoupper((string) $column['type']), 'INT')
+            && $submitted === ''
+            && !in_array($name, $nullFields, true)) {
+            continue;
         }
-    } else {
-        setFlash('error', 'No columns found to insert.');
+        $columns[] = $column;
+        $values[$name] = in_array($name, $nullFields, true) ? null : $submitted;
     }
-    header('Location: ' . getQueryString($table, $search, $colFilters));
-    exit;
+
+    try {
+        if ($columns === []) {
+            $db->exec('INSERT INTO ' . quoteIdentifier($table) . ' DEFAULT VALUES');
+        } else {
+            $columnSql = implode(', ', array_map(
+                static function (array $column) { return quoteIdentifier((string) $column['name']); },
+                $columns
+            ));
+            $placeholders = [];
+            foreach ($columns as $index => $column) $placeholders[] = ':v' . $index;
+            $statement = $db->prepare(
+                'INSERT INTO ' . quoteIdentifier($table)
+                . ' (' . $columnSql . ') VALUES (' . implode(', ', $placeholders) . ')'
+            );
+            foreach ($columns as $index => $column) {
+                $name = (string) $column['name'];
+                bindTyped($statement, ':v' . $index, $values[$name], (string) $column['type']);
+            }
+            $statement->execute();
+        }
+
+        $locator = tableLocator($db, $table);
+        $locatorValue = null;
+        if (!empty($locator['rowid'])) {
+            $locatorValue = $db->lastInsertRowID();
+        } elseif (!empty($locator['column'])) {
+            $locatorValue = $values[$locator['column']] ?? $db->lastInsertRowID();
+        }
+        if ($locatorValue !== null) {
+            pushHistory('insert', $table, ['locator' => $locator, 'locator_value' => $locatorValue]);
+        }
+        setFlash('success', 'New row inserted.');
+    } catch (Throwable $exception) {
+        $message = str_contains($exception->getMessage(), 'UNIQUE constraint failed')
+            ? 'A row with that unique or primary-key value already exists.'
+            : $exception->getMessage();
+        setFlash('error', 'Insert failed: ' . $message);
+    }
+    redirectTo(getQueryString($table, $search, $colFilters));
 }
 
 // ----- GATHER DATABASE INFO (for sidebar) -----
 $dbSize = file_exists($dbFile) ? filesize($dbFile) : 0;
 $dbSizeFormatted = $dbSize ? round($dbSize / 1024, 1) . ' KB' : '0 KB';
 if ($dbSize > 1048576) $dbSizeFormatted = round($dbSize / 1048576, 1) . ' MB';
-$tableCountResult = $db->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
-$tableCount = $tableCountResult->fetchArray(SQLITE3_NUM)[0] ?? 0;
+$tableCount = (int) $db->querySingle("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
+$viewCount = (int) $db->querySingle("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name NOT LIKE 'sqlite_%'");
 $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) : 'N/A';
 
 // ----- PAGE OUTPUT -----
@@ -979,6 +1439,29 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         transition: background 0.2s, color 0.2s;
         display: flex;
         flex-direction: column;
+    }
+    /* Compact scrollbars keep more room available for table data. */
+    * {
+        scrollbar-width: thin;
+        scrollbar-color: var(--text-muted) transparent;
+    }
+    *::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    *::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    *::-webkit-scrollbar-thumb {
+        background: var(--text-muted);
+        border: 2px solid transparent;
+        background-clip: padding-box;
+        border-radius: 999px;
+    }
+    *::-webkit-scrollbar-thumb:hover {
+        background: var(--primary);
+        border: 2px solid transparent;
+        background-clip: padding-box;
     }
     :root {
         --bg-body: #f1f5f9;
@@ -1034,7 +1517,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         --flash-error-text: #fca5a5;
         --footer-bg: #1a2332;
     }
-    
+
     /* ----- Master Layout Containers ----- */
     .app-container {
         display: flex;
@@ -1043,7 +1526,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         overflow: hidden;
         background: var(--bg-body);
     }
-    
+
     /* Sidebar with variable width */
     .sidebar {
         width: var(--sidebar-width);
@@ -1056,7 +1539,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         display: flex;
         flex-direction: column;
     }
-    
+
     .main {
         flex: 1;
         min-width: 0;
@@ -1099,7 +1582,10 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         background: var(--primary);
     }
 
-    #col-filter-form,
+    /* The filter form is only a submission target and must not consume layout space. */
+    #col-filter-form {
+        display: none;
+    }
     .query-area {
         display: flex;
         flex-direction: column;
@@ -1450,7 +1936,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
     .btn-purple:hover { background: var(--purple-hover); color: #fff; }
     .btn-outline { background: transparent; border: 1px solid var(--border-color); color: var(--text-body); }
     .btn-outline:hover { background: var(--border-color); }
-    
+
     #bulk-delete-btn { display: none; }
     #bulk-delete-btn.visible {
         display: inline-flex;
@@ -1562,8 +2048,8 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 
     /* ----- Advanced Table Wrapper & Sticky Constraints ----- */
     .table-wrap {
-        flex: 1; 
-        min-height: 0; 
+        flex: 1;
+        min-height: 0;
         overflow: auto;
         margin: 0 -2rem;
         border-top: 1px solid var(--border-color);
@@ -1601,7 +2087,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         vertical-align: middle;
         white-space: nowrap;
     }
-    
+
     td {
         max-width: 280px;
         overflow: hidden;
@@ -1612,13 +2098,16 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 
     .table-wrap thead {
         position: sticky;
-        top: 0;
+        top: -1px;
         z-index: 10;
+        box-shadow: 0 2px 0 var(--border-color);
     }
-    .table-wrap thead th {
+    .table-wrap thead th,
+    .table-wrap thead td {
         background: #e2e8f0;
     }
-    .dark .table-wrap thead th {
+    .dark .table-wrap thead th,
+    .dark .table-wrap thead td {
         background: #334155;
     }
 
@@ -1637,7 +2126,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         left: 48px;
         background: var(--bg-main);
         z-index: 5;
-        border-right: 2px solid var(--border-color); 
+        border-right: 2px solid var(--border-color);
     }
     .table-wrap thead th:nth-child(1),
     .table-wrap thead th:nth-child(2) {
@@ -1690,7 +2179,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
     .row-actions a.danger { color: var(--danger); }
     .row-actions a.danger:hover { color: var(--danger-hover); }
     .info-bar { display: none; }
-    
+
     /* ----- Forms & Queries ----- */
     .edit-form {
         background: var(--bg-sidebar);
@@ -1723,7 +2212,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         min-width: 120px;
     }
     .edit-form .actions { margin-top: 0.5rem; display: flex; gap: 0.5rem; }
-    
+
     .query-area textarea {
         width: 100%;
         height: 120px;
@@ -1740,7 +2229,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         outline-offset: -1px;
     }
     .query-area .btn { margin-top: 0.5rem; margin-bottom: 1rem; }
-    
+
     /* ----- Modals ----- */
     .modal {
         display: none;
@@ -1849,7 +2338,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         padding: 0.2rem 0.4rem;
         border-bottom: 1px solid var(--border-color);
     }
-    
+
     /* ----- Welcome Screen ----- */
     .welcome {
         text-align: center;
@@ -1872,7 +2361,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         width: 100%;
         max-width: 500px;
     }
-    
+
    /* ----- Dynamic Footer ----- */
 .footer-bar {
     flex-shrink: 0;
@@ -1971,10 +2460,10 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 .footer-right a:hover {
     text-decoration: underline;
 }
-    
+
     h2 i { margin-right: 0.3rem; color: var(--primary); }
     .header .brand i { color: var(--primary); }
-    
+
     /* ----- Mobile Responsive ----- */
     @media (max-width: 768px) {
         .sidebar { display: none; }
@@ -1993,6 +2482,73 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         /* Hide resize handle on mobile */
         .resize-handle { display: none; }
     }
+
+
+    /* ----- Release 1.1 additions ----- */
+    .brand a { color: inherit; text-decoration: none; display: inline-flex; align-items: center; gap: .5rem; }
+    .header-actions form { margin: 0; }
+    .header-action-button {
+        border: 0; background: transparent; color: var(--text-body); cursor: pointer;
+        font: inherit; font-size: .9rem; display: inline-flex; align-items: center; gap: .3rem;
+    }
+    .header-action-button:hover { color: var(--primary); }
+    .db-header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+    .db-delete-button {
+        border: 0; background: transparent; color: var(--danger); cursor: pointer;
+        padding: .25rem; border-radius: .25rem; flex: 0 0 auto;
+    }
+    .db-delete-button:hover { background: var(--border-color); color: var(--danger-hover); }
+    .object-badge {
+        display: inline-flex; align-items: center; padding: .05rem .42rem; border-radius: 999px;
+        background: var(--border-color); color: var(--text-muted); font-size: .64rem;
+        font-weight: 650; text-transform: uppercase; letter-spacing: .04em;
+    }
+    .view-notice {
+        display: inline-flex; align-items: center; gap: .4rem; margin-left: .5rem;
+        padding: .2rem .55rem; border: 1px solid var(--border-color); border-radius: 999px;
+        color: var(--text-muted); font-size: .74rem; font-weight: 600;
+    }
+    .feature-grid {
+        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .85rem;
+        width: min(980px, 100%); margin-top: 2rem;
+    }
+    .feature-card {
+        padding: 1rem; border: 1px solid var(--border-color); border-radius: .65rem;
+        background: var(--bg-sidebar); text-align: left; box-shadow: var(--shadow);
+    }
+    .feature-card > i { color: var(--primary); font-size: 1.3rem; margin-bottom: .55rem; }
+    .feature-card h4 { margin: 0 0 .3rem; font-size: .95rem; }
+    .feature-card p { margin: 0; color: var(--text-muted); font-size: .82rem; line-height: 1.45; }
+    .welcome-hero { text-align: center; }
+    .welcome-hero .tagline { margin: 0 auto; }
+    .data-field {
+        display: grid; grid-template-columns: minmax(130px, 1fr) auto; align-items: center;
+        gap: .35rem .6rem; min-width: min(100%, 310px);
+    }
+    .data-field > label { grid-column: 1 / -1; }
+    .data-field input[type="text"] { width: 100%; }
+    .null-toggle { display: inline-flex !important; align-items: center; gap: .25rem !important; font-size: .76rem !important; color: var(--text-muted); white-space: nowrap; }
+    .empty-value { color: var(--text-muted); font-style: italic; }
+    .inline-action-form { display: inline-flex; margin: 0; }
+    .row-action-button {
+        border: 0; background: transparent; color: var(--primary); cursor: pointer;
+        font-size: 1.05rem; min-width: 28px; min-height: 28px;
+    }
+    .row-action-button.danger { color: var(--danger); }
+    .row-action-button:hover { color: var(--primary-hover); }
+    .row-action-button.danger:hover { color: var(--danger-hover); }
+    .page-size-select {
+        padding: .2rem .35rem; border: 1px solid var(--input-border); border-radius: .25rem;
+        background: var(--input-bg); color: var(--text-body); font-size: .78rem;
+    }
+    .sql-warning {
+        margin-bottom: .75rem; padding: .65rem .8rem; border: 1px solid #f59e0b;
+        border-radius: .45rem; background: color-mix(in srgb, #f59e0b 12%, transparent);
+        color: var(--text-body); font-size: .84rem;
+    }
+    @media (max-width: 980px) { .feature-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 560px) { .feature-grid { grid-template-columns: 1fr; } }
+
 </style>
     <script>
         function toggleAll(source) {
@@ -2062,11 +2618,23 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
         }
         function hideDropConfirm() { hideModal('drop-confirm-modal'); }
         function proceedDrop() {
-            var tableName = document.getElementById('drop-confirm-table').value;
-            if (tableName) {
-                window.location.href = '?action=drop_table&table=' + encodeURIComponent(tableName);
-            }
-            hideDropConfirm();
+            const form = document.getElementById('drop-table-form');
+            if (form && document.getElementById('drop-confirm-table').value) form.submit();
+        }
+        function showDeleteDatabaseModal(databaseName) {
+            const nameField = document.getElementById('delete-db-name');
+            const confirmField = document.getElementById('delete-db-confirm-name');
+            const label = document.getElementById('delete-db-label');
+            if (nameField) nameField.value = databaseName;
+            if (confirmField) confirmField.value = '';
+            if (label) label.textContent = databaseName;
+            showModal('delete-db-modal');
+        }
+        function changePageSize(select) {
+            const params = new URLSearchParams(window.location.search);
+            params.set('limit', select.value);
+            params.set('offset', '0');
+            window.location.search = params.toString();
         }
         function fetchSchema(tableName) {
             fetch('?action=get_schema&table=' + encodeURIComponent(tableName))
@@ -2092,6 +2660,8 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                     tableEl.innerHTML += '</tbody>';
                     container.appendChild(tableEl);
                     document.getElementById('edit-schema-table').value = tableName;
+                    const renameTable = document.getElementById('rename-column-table');
+                    if (renameTable) renameTable.value = tableName;
                     showModal('edit-schema-modal');
                 })
                 .catch(err => {
@@ -2099,8 +2669,18 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                 });
         }
         function hideEditSchemaModal() { hideModal('edit-schema-modal'); }
+        let columnRowCounter = 0;
+        function refreshColumnRowIndexes() {
+            const container = document.getElementById('column-rows');
+            if (!container) return;
+            container.querySelectorAll('.column-row').forEach(function(row, index) {
+                const primaryKey = row.querySelector('input[name="primary_key_index"]');
+                if (primaryKey) primaryKey.value = String(index);
+            });
+        }
         function addColumnRow() {
             const container = document.getElementById('column-rows');
+            const rowIndex = columnRowCounter++;
             const row = document.createElement('div');
             row.className = 'column-row';
             row.innerHTML = `
@@ -2111,17 +2691,19 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                     <option value="REAL">REAL</option>
                     <option value="NUMERIC">NUMERIC</option>
                     <option value="BLOB">BLOB</option>
-                    <option value="NULL">NULL</option>
                 </select>
-                <label><input type="checkbox" name="col_pk[]" value="1"> PK</label>
+                <label><input type="radio" name="primary_key_index" value="${rowIndex}"> PK</label>
                 <button type="button" class="remove-col" onclick="removeColumnRow(this)" title="Remove column"><i class="fas fa-times"></i></button>
             `;
             container.appendChild(row);
+            refreshColumnRowIndexes();
         }
         function removeColumnRow(btn) {
+            const container = document.getElementById('column-rows');
             const row = btn.closest('.column-row');
-            if (document.querySelectorAll('.column-row').length > 1) {
+            if (container && container.querySelectorAll('.column-row').length > 1) {
                 row.remove();
+                refreshColumnRowIndexes();
             } else {
                 alert('You need at least one column.');
             }
@@ -2234,13 +2816,16 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 <body>
     <header class="header">
         <div class="brand">
-            <i class="fas fa-database"></i> SQLite Admin
+            <a href="<?php echo h(currentAppPath()); ?>"><i class="fas fa-database"></i> SQLite Admin</a>
         </div>
         <div class="header-actions">
             <a href="?theme=<?php echo $isDark ? 'light' : 'dark'; ?>" class="theme-toggle" title="Toggle theme">
                 <i class="fas <?php echo $isDark ? 'fa-sun' : 'fa-moon'; ?>"></i>
             </a>
-            <a href="?logout=1" title="Logout"><i class="fas fa-sign-out-alt"></i> Logout</a>
+            <form method="post" action="?action=logout">
+                <?php echo csrfField(); ?>
+                <button type="submit" class="header-action-button" title="Logout"><i class="fas fa-sign-out-alt"></i> Logout</button>
+            </form>
         </div>
     </header>
 
@@ -2249,9 +2834,14 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
             <div class="db-header">
                 <div class="db-name">
                     <i class="fas fa-database"></i>
-                    <?php echo htmlspecialchars(basename($dbFile)); ?>
-                    <span class="size">(<?php echo $dbSizeFormatted; ?>)</span>
+                    <span><?php echo h(basename($dbFile)); ?></span>
+                    <span class="size">(<?php echo h($dbSizeFormatted); ?>)</span>
                 </div>
+                <?php if (realpath($dbFile) !== realpath($configuredDbFile)): ?>
+                    <button type="button" class="db-delete-button" onclick="showDeleteDatabaseModal('<?php echo h(basename($dbFile)); ?>')" title="Delete this imported database">
+                        <i class="fas fa-trash-alt"></i>
+                    </button>
+                <?php endif; ?>
             </div>
 
             <!-- Database Switcher -->
@@ -2269,35 +2859,46 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
             </div>
 
             <div class="tables-heading">
-                <h3><i class="fas fa-table"></i> Tables (<?php echo $tableCount; ?>)</h3>
+                <h3><i class="fas fa-table"></i> Tables &amp; Views (<?php echo $tableCount + $viewCount; ?>)</h3>
                 <button class="btn-plus" onclick="showCreateTableModal();" title="Create new table"><i class="fas fa-plus-circle"></i></button>
             </div>
 
             <div class="table-list">
                 <?php
-                $tables = $db->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
-                $hasTables = false;
-                while ($row = $tables->fetchArray(SQLITE3_ASSOC)) {
-                    $hasTables = true;
-                    $name = $row['name'];
+                $objects = $db->query(
+                    "SELECT name, type FROM sqlite_master "
+                    . "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' "
+                    . "ORDER BY type, name"
+                );
+                $hasObjects = false;
+                while ($row = $objects->fetchArray(SQLITE3_ASSOC)) {
+                    $hasObjects = true;
+                    $name = (string) $row['name'];
+                    $type = (string) $row['type'];
                     $active = ($name === $table) ? 'active' : '';
-                    $countResult = $db->query("SELECT COUNT(*) FROM " . SQLite3::escapeString($name));
-                    $rowCount = $countResult->fetchArray(SQLITE3_NUM)[0] ?? 0;
+                    try {
+                        $rowCount = (int) $db->querySingle('SELECT COUNT(*) FROM ' . quoteIdentifier($name));
+                    } catch (Throwable $ignoredException) {
+                        $rowCount = 0;
+                    }
                     echo '<div class="table-item">';
                     echo '<a href="?table=' . urlencode($name) . '" class="' . $active . '">';
-                    echo '<span class="icon"><i class="fas fa-chevron-right"></i></span>';
-                    echo '<span class="name">' . htmlspecialchars($name) . ' <span class="row-count">' . $rowCount . '</span></span>';
+                    echo '<span class="icon"><i class="fas ' . ($type === 'view' ? 'fa-eye' : 'fa-table') . '"></i></span>';
+                    echo '<span class="name">' . h($name)
+                        . ($type === 'view' ? ' <span class="object-badge">view</span>' : '')
+                        . ' <span class="row-count">' . number_format($rowCount) . '</span></span>';
                     echo '</a>';
                     echo '<div class="table-actions">';
-                    echo '<button onclick="fetchSchema(\'' . addslashes($name) . '\')" title="Show schema"><i class="fas fa-info-circle"></i></button>';
-                    echo '<button onclick="showEditSchema(\'' . addslashes($name) . '\')" title="Edit schema"><i class="fas fa-cog"></i></button>';
-                    echo '<button onclick="showRenameModal(\'' . addslashes($name) . '\')" title="Rename table"><i class="fas fa-pencil-alt"></i></button>';
-                    echo '<button class="danger" onclick="confirmDrop(\'' . addslashes($name) . '\')" title="Drop table"><i class="fas fa-trash-alt"></i></button>';
-                    echo '</div>';
-                    echo '</div>';
+                    echo '<button onclick="fetchSchema(' . h(json_encode($name)) . ')" title="Show schema"><i class="fas fa-info-circle"></i></button>';
+                    if ($type === 'table') {
+                        echo '<button onclick="showEditSchema(' . h(json_encode($name)) . ')" title="Edit schema"><i class="fas fa-cog"></i></button>';
+                        echo '<button onclick="showRenameModal(' . h(json_encode($name)) . ')" title="Rename table"><i class="fas fa-pencil-alt"></i></button>';
+                        echo '<button class="danger" onclick="confirmDrop(' . h(json_encode($name)) . ')" title="Drop table"><i class="fas fa-trash-alt"></i></button>';
+                    }
+                    echo '</div></div>';
                 }
-                if (!$hasTables) {
-                    echo '<div style="padding:0.5rem 1.2rem;color:var(--text-muted);font-size:0.85rem;font-style:italic;">No tables yet</div>';
+                if (!$hasObjects) {
+                    echo '<div style="padding:0.5rem 1.2rem;color:var(--text-muted);font-size:0.85rem;font-style:italic;">No tables or views yet</div>';
                 }
                 ?>
             </div>
@@ -2333,11 +2934,34 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                 <div class="modal-content">
                     <h3><i class="fas fa-exclamation-triangle" style="color:var(--danger);"></i> Confirm Drop Table</h3>
                     <p style="color:var(--text-muted);margin-bottom:1rem;">Are you sure you want to drop this table? This action <strong>cannot be undone</strong>.</p>
-                    <input type="hidden" id="drop-confirm-table" value="">
-                    <div class="actions">
-                        <button type="button" class="btn btn-outline" onclick="hideDropConfirm();">Cancel</button>
-                        <button type="button" class="btn btn-danger" onclick="proceedDrop();"><i class="fas fa-trash-alt"></i> Drop Table</button>
-                    </div>
+                    <form id="drop-table-form" method="post" action="?action=drop_table">
+                        <?php echo csrfField(); ?>
+                        <input type="hidden" id="drop-confirm-table" name="table" value="">
+                        <div class="actions">
+                            <button type="button" class="btn btn-outline" onclick="hideDropConfirm();">Cancel</button>
+                            <button type="button" class="btn btn-danger" onclick="proceedDrop();"><i class="fas fa-trash-alt"></i> Drop Table</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Delete Database Modal -->
+            <div id="delete-db-modal" class="modal">
+                <div class="modal-content">
+                    <h3><i class="fas fa-database" style="color:var(--danger);"></i> Delete Imported Database</h3>
+                    <p style="color:var(--text-muted);margin-bottom:.75rem;">This permanently deletes <strong id="delete-db-label"></strong> from the server. The configured primary database cannot be deleted here.</p>
+                    <form method="post" action="?action=delete_db">
+                        <?php echo csrfField(); ?>
+                        <input type="hidden" id="delete-db-name" name="db" value="">
+                        <div class="form-group">
+                            <label for="delete-db-confirm-name">Type the filename to confirm</label>
+                            <input type="text" id="delete-db-confirm-name" name="confirm_name" required autocomplete="off">
+                        </div>
+                        <div class="actions">
+                            <button type="button" class="btn btn-outline" onclick="hideModal('delete-db-modal');">Cancel</button>
+                            <button type="submit" class="btn btn-danger"><i class="fas fa-trash-alt"></i> Delete Database</button>
+                        </div>
+                    </form>
                 </div>
             </div>
 
@@ -2394,8 +3018,9 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                 <div class="modal-content">
                     <h3><i class="fas fa-upload"></i> Import Table</h3>
                     <p style="color:var(--text-muted);font-size:0.9rem;">Upload a CSV or JSON file to insert into the current table.</p>
-                    <?php if ($table): ?>
+                    <?php if ($table && !$isView): ?>
                     <form method="post" enctype="multipart/form-data" action="?table=<?php echo urlencode($table); ?>&action=import_table<?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>">
+                        <?php echo csrfField(); ?>
                         <div class="file-input-wrapper">
                             <span class="file-label" id="file-label">Choose a file...</span>
                             <input type="file" name="import_file" accept=".csv,.json" required onchange="document.getElementById('file-label').textContent = this.files[0] ? this.files[0].name : 'Choose a file...';">
@@ -2406,7 +3031,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                         </div>
                     </form>
                     <?php else: ?>
-                    <p style="color:var(--danger);">Please select a table first.</p>
+                    <p style="color:var(--danger);"><?php echo $isView ? 'Views are read-only. Import into an underlying table.' : 'Please select a table first.'; ?></p>
                     <div class="actions">
                         <button type="button" class="btn btn-outline" onclick="hideModal('import-table-modal');">Close</button>
                     </div>
@@ -2420,6 +3045,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                     <h3><i class="fas fa-upload"></i> Import Database</h3>
                     <p style="color:var(--text-muted);font-size:0.9rem;">Upload a SQLite database file (.sqlite, .db, .sqlite3). It will be saved alongside the current database.</p>
                     <form method="post" enctype="multipart/form-data" action="?action=import_db">
+                        <?php echo csrfField(); ?>
                         <div class="file-input-wrapper">
                             <span class="file-label" id="db-file-label">Choose a file...</span>
                             <input type="file" name="db_file" accept=".sqlite,.db,.sqlite3" required onchange="document.getElementById('db-file-label').textContent = this.files[0] ? this.files[0].name : 'Choose a file...';">
@@ -2437,6 +3063,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                 <div class="modal-content">
                     <h3><i class="fas fa-plus-circle"></i> Create New Table</h3>
                     <form method="post" action="?action=create_table" id="create-table-form">
+                        <?php echo csrfField(); ?>
                         <div class="form-group">
                             <label for="table_name">Table Name</label>
                             <input type="text" id="table_name" name="table_name" placeholder="e.g. products" required pattern="[a-zA-Z_][a-zA-Z0-9_]*" title="Letters, numbers, underscores, starting with letter or underscore">
@@ -2459,6 +3086,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                 <div class="modal-content">
                     <h3><i class="fas fa-edit"></i> Rename Table</h3>
                     <form method="post" action="?action=rename_table">
+                        <?php echo csrfField(); ?>
                         <input type="hidden" id="rename-old-name" name="old_name">
                         <div class="form-group">
                             <label for="rename-new-name">New Table Name</label>
@@ -2489,6 +3117,7 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                     <h3><i class="fas fa-cog"></i> Edit Schema</h3>
                     <div id="edit-schema-columns" class="current-columns"></div>
                     <form method="post" action="?action=add_column">
+                        <?php echo csrfField(); ?>
                         <input type="hidden" id="edit-schema-table" name="table">
                         <div class="form-group">
                             <label>Add New Column</label>
@@ -2500,7 +3129,6 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                                     <option value="REAL">REAL</option>
                                     <option value="NUMERIC">NUMERIC</option>
                                     <option value="BLOB">BLOB</option>
-                                    <option value="NULL">NULL</option>
                                 </select>
                                 <button type="submit" class="btn btn-success"><i class="fas fa-plus"></i> Add</button>
                             </div>
@@ -2508,7 +3136,8 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
                     </form>
                     <div style="margin-top:0.8rem;border-top:1px solid var(--border-color);padding-top:0.8rem;">
                         <form method="post" action="?action=rename_column" style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
-                            <input type="hidden" name="table" value="<?php echo htmlspecialchars($table); ?>">
+                            <?php echo csrfField(); ?>
+                            <input type="hidden" id="rename-column-table" name="table" value="<?php echo h($table); ?>">
                             <input type="text" name="old_col" placeholder="Current column name" required pattern="[a-zA-Z_][a-zA-Z0-9_]*" style="flex:1;min-width:100px;padding:0.3rem 0.6rem;border:1px solid var(--input-border);border-radius:0.25rem;background:var(--input-bg);color:var(--text-body);font-size:0.9rem;">
                             <span>→</span>
                             <input type="text" name="new_col" placeholder="New column name" required pattern="[a-zA-Z_][a-zA-Z0-9_]*" style="flex:1;min-width:100px;padding:0.3rem 0.6rem;border:1px solid var(--input-border);border-radius:0.25rem;background:var(--input-bg);color:var(--text-body);font-size:0.9rem;">
@@ -2524,36 +3153,39 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
             <?php if ($action === 'query'): ?>
                 <h2 style="margin-bottom:0.75rem;"><i class="fas fa-terminal"></i> SQL Query</h2>
                 <div class="query-area">
+                    <div class="sql-warning"><strong>Advanced access:</strong> SQL entered here runs with full write permissions. Export a backup first before running destructive statements.</div>
                     <form method="post">
-                        <textarea name="sql" placeholder="Write your SQL query here…"><?php echo isset($_POST['sql']) ? htmlspecialchars($_POST['sql']) : ''; ?></textarea>
+                        <?php echo csrfField(); ?>
+                        <textarea name="sql" placeholder="Write your SQL query here…"><?php echo h($_POST['sql'] ?? ''); ?></textarea>
                         <button type="submit" class="btn btn-primary"><i class="fas fa-play"></i> Execute</button>
                     </form>
                     <?php
                     if (isset($_POST['sql']) && $_POST['sql'] !== '') {
+                        requireCsrf();
                         try {
                             $result = $db->query($_POST['sql']);
                             if ($result === false) {
-                                echo '<p style="color:var(--danger);margin-top:0.5rem;">Error: ' . $db->lastErrorMsg() . '</p>';
+                                echo '<p style="color:var(--danger);margin-top:0.5rem;">Error: ' . h($db->lastErrorMsg()) . '</p>';
                             } else {
                                 $cols = $result->numColumns();
                                 if ($cols == 0) {
                                     echo '<p style="color:var(--success);margin-top:0.5rem;">✓ Query executed successfully (no rows returned).</p>';
                                 } else {
                                     echo '<div class="table-wrap"><table><tr>';
-                                    for ($i = 0; $i < $cols; $i++) echo '<th>' . htmlspecialchars($result->columnName($i)) . '</th>';
+                                    for ($i = 0; $i < $cols; $i++) echo '<th>' . h($result->columnName($i)) . '</th>';
                                     echo '</tr>';
                                     while ($row = $result->fetchArray(SQLITE3_NUM)) {
                                         echo '<tr>';
                                         foreach ($row as $val) {
-                                            echo '<td>' . ($val === null ? '<i>NULL</i>' : htmlspecialchars($val)) . '</td>';
+                                            echo '<td>' . ($val === null ? '<i>NULL</i>' : h($val)) . '</td>';
                                         }
                                         echo '</tr>';
                                     }
                                     echo '</table></div>';
                                 }
                             }
-                        } catch (Exception $e) {
-                            echo '<p style="color:var(--danger);margin-top:0.5rem;">Error: ' . $e->getMessage() . '</p>';
+                        } catch (Throwable $e) {
+                            echo '<p style="color:var(--danger);margin-top:0.5rem;">Error: ' . h($e->getMessage()) . '</p>';
                         }
                     }
                     ?>
@@ -2561,75 +3193,92 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 
             <?php elseif ($table === ''): ?>
                 <div class="welcome">
-                    <div class="icon"><i class="fas fa-database"></i></div>
-                    <h1>Welcome to SQLite Admin</h1>
-                    <p>This is a lightweight, self‑contained admin tool for SQLite databases.<br>
-                    To get started, select a table from the sidebar or run a SQL query.</p>
-                    <p style="margin-top:0.5rem;font-size:0.95rem;">
-                        <i class="fas fa-chevron-left" style="color:var(--primary);"></i> 
-                        Click a table name to browse, or use the <strong>SQL Query</strong> link below.
-                    </p>
+                    <div class="welcome-hero">
+                        <div class="icon"><i class="fas fa-database"></i></div>
+                        <h1>SQLite Admin</h1>
+                        <p class="tagline">A lightweight, self-hosted interface for browsing and maintaining SQLite databases.</p>
+                    </div>
+
+                    <div class="feature-grid">
+                        <div class="feature-card"><i class="fas fa-table"></i><h4>Browse &amp; Edit</h4><p>View, insert, update, and delete rows while preserving real NULL values.</p></div>
+                        <div class="feature-card"><i class="fas fa-eye"></i><h4>SQLite Views</h4><p>Browse and export views safely in read-only mode.</p></div>
+                        <div class="feature-card"><i class="fas fa-upload"></i><h4>Import / Export</h4><p>CSV, JSON, SQL, and consistent full-database snapshots.</p></div>
+                        <div class="feature-card"><i class="fas fa-undo-alt"></i><h4>Undo</h4><p>Restore the last five row or schema actions.</p></div>
+                        <div class="feature-card"><i class="fas fa-columns"></i><h4>Schema Management</h4><p>Create and rename tables, then add or rename columns.</p></div>
+                        <div class="feature-card"><i class="fas fa-search"></i><h4>Filter &amp; Search</h4><p>Search across all columns or narrow results column by column.</p></div>
+                        <div class="feature-card"><i class="fas fa-database"></i><h4>Multiple Databases</h4><p>Import and switch between databases stored in the configured directory.</p></div>
+                        <div class="feature-card"><i class="fas fa-arrows-alt-h"></i><h4>Resizable Sidebar</h4><p>Drag the sidebar width and keep the preference in your browser.</p></div>
+                    </div>
+
                     <div class="license">
-                        <p><i class="fas fa-code"></i> SQLite Admin – Open Source under the <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener">MIT License</a></p>
-                        <p style="margin-top:0.3rem;font-size:0.8rem;">
-                            <a href="https://github.com/yourusername/sqlite-admin" target="_blank" rel="noopener"><i class="fab fa-github"></i> GitHub</a>
-                        </p>
+                        <p><i class="fas fa-code"></i> SQLite Admin <?php echo h(SQLITE_ADMIN_VERSION); ?> – MIT License</p>
+                        <p style="margin-top:.3rem;font-size:.8rem;">Developed by <a href="https://abilenetechguy.com" target="_blank" rel="noopener">Abilene Tech Guy</a> &nbsp;•&nbsp; <a href="<?php echo h(SQLITE_ADMIN_PROJECT_URL); ?>" target="_blank" rel="noopener"><i class="fab fa-github"></i> Report bugs on GitHub</a></p>
                     </div>
                 </div>
 
             <?php else:
-                $safeTable = SQLite3::escapeString($table);
-                $pkCol = null;
-                $cols = [];
-                $info = $db->query("PRAGMA table_info($safeTable)");
-                while ($row = $info->fetchArray(SQLITE3_ASSOC)) {
-                    $cols[] = $row['name'];
-                    if ($row['pk']) $pkCol = $row['name'];
+                $columnInfo = tableInfo($db, $table);
+                $cols = array_map(static function (array $column) { return (string) $column['name']; }, $columnInfo);
+                $columnTypes = [];
+                foreach ($columnInfo as $column) {
+                    $columnTypes[(string) $column['name']] = (string) $column['type'];
                 }
-                $useRowid = false;
-                if ($pkCol === null) {
-                    $pkCol = 'rowid';
-                    $useRowid = true;
-                }
+                $locator = $isView ? ['column' => null, 'rowid' => false] : tableLocator($db, $table);
+                $pkCol = $locator['column'];
+                $useRowid = !empty($locator['rowid']);
+                $canEditRows = !$isView && !empty($pkCol);
 
-                if ($action === 'insert') {
-                    echo '<h2 style="margin-bottom:0.75rem;"><i class="fas fa-plus-circle"></i> Insert new row into ' . htmlspecialchars($table) . '</h2>';
-                    echo '<div class="edit-form"><form method="post">';
-                    echo '<input type="hidden" name="new" value="1">';
-                    echo '<div class="form-group">';
-                    foreach ($cols as $col) {
-                        echo '<label>' . htmlspecialchars($col) . ': <input type="text" name="' . htmlspecialchars($col) . '"></label>';
-                    }
-                    echo '</div>';
-                    echo '<div class="actions"><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Insert</button>';
-                    echo ' <a href="' . getQueryString($table, $search, $colFilters) . '" class="btn btn-outline">Cancel</a></div>';
-                    echo '</form></div>';
-                    $showTable = false;
-                } elseif ($action === 'edit' && isset($_GET['pk'])) {
-                    $pkVal = $_GET['pk'];
-                    $safePkVal = SQLite3::escapeString($pkVal);
-                    if ($useRowid) {
-                        $result = $db->query("SELECT * FROM $safeTable WHERE rowid = '$safePkVal'");
-                    } else {
-                        $safePk = SQLite3::escapeString($pkCol);
-                        $result = $db->query("SELECT * FROM $safeTable WHERE $safePk = '$safePkVal'");
-                    }
-                    $row = $result->fetchArray(SQLITE3_ASSOC);
-                    if ($row) {
-                        echo '<h2 style="margin-bottom:0.75rem;"><i class="fas fa-edit"></i> Edit row in ' . htmlspecialchars($table) . '</h2>';
-                        echo '<div class="edit-form"><form method="post" action="' . getQueryString($table, $search, $colFilters, ['action' => 'update']) . '">';
-                        echo '<input type="hidden" name="pk" value="' . htmlspecialchars($pkVal) . '">';
-                        echo '<div class="form-group">';
-                        foreach ($cols as $col) {
-                            $val = $row[$col] ?? '';
-                            echo '<label>' . htmlspecialchars($col) . ': <input type="text" name="' . htmlspecialchars($col) . '" value="' . htmlspecialchars($val) . '"></label>';
+                if ($action === 'insert' && !$isView) {
+                    echo '<h2 style="margin-bottom:.75rem;"><i class="fas fa-plus-circle"></i> Insert new row into ' . h($table) . '</h2>';
+                    echo '<div class="edit-form"><form method="post" action="' . h(getQueryString($table, $search, $colFilters, ['action' => 'insert'])) . '">';
+                    echo csrfField();
+                    echo '<input type="hidden" name="new" value="1"><div class="form-group">';
+                    foreach ($columnInfo as $column) {
+                        $name = (string) $column['name'];
+                        if (str_contains(strtoupper((string) $column['type']), 'BLOB')) {
+                            echo '<div class="data-field"><label>' . h($name) . ' <small>(BLOB)</small></label><span class="empty-value">Use SQL or import to set binary data.</span></div>';
+                            continue;
                         }
-                        echo '</div>';
-                        echo '<div class="actions"><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Update</button>';
-                        echo ' <a href="' . getQueryString($table, $search, $colFilters) . '" class="btn btn-outline">Cancel</a></div>';
-                        echo '</form></div>';
+                        $hint = ((int) $column['pk'] > 0 && str_contains(strtoupper((string) $column['type']), 'INT'))
+                            ? ' placeholder="Leave blank for automatic value"'
+                            : '';
+                        echo '<div class="data-field"><label for="insert-' . h($name) . '">' . h($name) . ' <small>(' . h($column['type'] ?: 'ANY') . ')</small></label>';
+                        echo '<input id="insert-' . h($name) . '" type="text" name="' . h($name) . '"' . $hint . '>';
+                        echo '<label class="null-toggle"><input type="checkbox" name="null_fields[]" value="' . h($name) . '"> NULL</label></div>';
+                    }
+                    echo '</div><div class="actions"><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Insert</button> ';
+                    echo '<a href="' . h(getQueryString($table, $search, $colFilters)) . '" class="btn btn-outline">Cancel</a></div></form></div>';
+                    $showTable = false;
+                } elseif ($action === 'edit' && !$isView && isset($_GET['pk'])) {
+                    $pkValue = (string) $_GET['pk'];
+                    $editRow = fetchRowByLocator($db, $table, $locator, $pkValue);
+                    if ($editRow) {
+                        echo '<h2 style="margin-bottom:.75rem;"><i class="fas fa-edit"></i> Edit row in ' . h($table) . '</h2>';
+                        echo '<div class="edit-form"><form method="post" action="' . h(getQueryString($table, $search, $colFilters, ['action' => 'update'])) . '">';
+                        echo csrfField();
+                        echo '<input type="hidden" name="pk" value="' . h($pkValue) . '"><div class="form-group">';
+                        foreach ($columnInfo as $column) {
+                            $name = (string) $column['name'];
+                            $value = $editRow[$name] ?? null;
+                            if (str_contains(strtoupper((string) $column['type']), 'BLOB')) {
+                                echo '<div class="data-field"><label>' . h($name) . ' <small>(BLOB)</small></label><span class="empty-value">Binary field preserved; use SQL or import to replace it.</span></div>';
+                                continue;
+                            }
+                            $isLocator = !$useRowid && $name === $pkCol;
+                            echo '<div class="data-field"><label for="edit-' . h($name) . '">' . h($name) . ' <small>(' . h($column['type'] ?: 'ANY') . ')</small></label>';
+                            echo '<input id="edit-' . h($name) . '" type="text" name="' . h($name) . '" value="' . h($value ?? '') . '"' . ($isLocator ? ' readonly' : '') . '>';
+                            if (!$isLocator) {
+                                echo '<label class="null-toggle"><input type="checkbox" name="null_fields[]" value="' . h($name) . '"' . ($value === null ? ' checked' : '') . '> NULL</label>';
+                            } else {
+                                echo '<span class="null-toggle">Primary key</span>';
+                            }
+                            echo '</div>';
+                        }
+                        echo '</div><div class="actions"><button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Update</button> ';
+                        echo '<a href="' . h(getQueryString($table, $search, $colFilters)) . '" class="btn btn-outline">Cancel</a></div></form></div>';
                         $showTable = false;
                     } else {
+                        setFlash('error', 'Row not found.');
                         $showTable = true;
                     }
                 } else {
@@ -2638,121 +3287,136 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
 
                 if ($showTable):
                 ?>
-                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;margin-bottom:0.5rem;">
-                    <h2 style="margin:0;font-size:1.4rem;"><i class="fas fa-table"></i> <?php echo htmlspecialchars($table); ?></h2>
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem;">
+                    <h2 style="margin:0;font-size:1.4rem;">
+                        <i class="fas <?php echo $isView ? 'fa-eye' : 'fa-table'; ?>"></i>
+                        <?php echo h($table); ?>
+                        <?php if ($isView): ?><span class="view-notice"><i class="fas fa-lock"></i> Read-only view</span><?php endif; ?>
+                    </h2>
                 </div>
+
+                <?php if (!$isView && !$canEditRows): ?>
+                    <div class="flash flash-error"><i class="fas fa-exclamation-circle"></i> This table has no single primary key or usable rowid, so row editing is disabled. Browsing and export still work.</div>
+                <?php endif; ?>
 
                 <div class="toolbar-row">
                     <div class="btn-group">
-                        <a href="?table=<?php echo urlencode($table); ?>&action=insert<?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>" class="btn btn-success"><i class="fas fa-plus"></i> Insert Row</a>
+                        <?php if ($canEditRows): ?>
+                            <a href="<?php echo h(getQueryString($table, $search, $colFilters, ['action' => 'insert'])); ?>" class="btn btn-success"><i class="fas fa-plus"></i> Insert Row</a>
+                        <?php endif; ?>
                         <button id="toggle-filter-btn" class="btn btn-purple" onclick="toggleFilterRow();"><i class="fas fa-filter"></i> Filters</button>
-                        <form method="post" action="?table=<?php echo urlencode($table); ?>&action=bulk_delete<?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>" onsubmit="return confirmBulkDelete();" style="display:inline;">
-                            <button type="submit" id="bulk-delete-btn" class="btn btn-danger"><i class="fas fa-trash-alt"></i> Delete</button>
-                        </form>
-                        <?php
-                        $undoCount = isset($_SESSION['undo_history']) ? count($_SESSION['undo_history']) : 0;
-                        ?>
-                        <a href="?action=undo<?php echo $table ? '&table='.urlencode($table) : ''; ?><?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>" class="undo-btn <?php echo $undoCount > 0 ? '' : 'disabled'; ?>" title="Undo last action" <?php echo $undoCount > 0 ? '' : 'disabled'; ?>>
-                            <i class="fas fa-undo-alt"></i> Undo <?php echo $undoCount > 0 ? '('.$undoCount.')' : ''; ?>
-                        </a>
+                        <?php if ($canEditRows): ?>
+                            <form id="bulk-delete-form" method="post" action="<?php echo h(getQueryString($table, $search, $colFilters, ['action' => 'bulk_delete'])); ?>" onsubmit="return confirmBulkDelete();" style="display:inline;">
+                                <?php echo csrfField(); ?>
+                                <button type="submit" id="bulk-delete-btn" class="btn btn-danger"><i class="fas fa-trash-alt"></i> Delete</button>
+                            </form>
+                            <?php $undoCount = count($_SESSION['undo_history'] ?? []); ?>
+                            <form method="post" action="<?php echo h(getQueryString($table, $search, $colFilters, ['action' => 'undo'])); ?>" style="display:inline;">
+                                <?php echo csrfField(); ?>
+                                <button type="submit" class="undo-btn" title="Undo last action" <?php echo $undoCount > 0 ? '' : 'disabled'; ?>>
+                                    <i class="fas fa-undo-alt"></i> Undo <?php echo $undoCount > 0 ? '(' . $undoCount . ')' : ''; ?>
+                                </button>
+                            </form>
+                        <?php endif; ?>
                     </div>
                     <form method="get" class="search-box" id="search-form">
-                        <input type="hidden" name="table" value="<?php echo htmlspecialchars($table); ?>">
-                        <input type="text" name="search" placeholder="Search all…" value="<?php echo htmlspecialchars($search); ?>">
+                        <input type="hidden" name="table" value="<?php echo h($table); ?>">
+                        <input type="hidden" name="limit" value="<?php echo $limit; ?>">
+                        <input type="text" name="search" placeholder="Search all…" value="<?php echo h($search); ?>">
                         <button type="submit" class="btn btn-primary"><i class="fas fa-search"></i></button>
-                        <?php if ($search || !empty($colFilters)): ?>
-                            <a href="?table=<?php echo urlencode($table); ?>" class="btn btn-outline"><i class="fas fa-times"></i></a>
+                        <?php if ($search !== '' || $colFilters !== []): ?>
+                            <a href="<?php echo h(getQueryString($table, '', [], ['limit' => $limit])); ?>" class="btn btn-outline"><i class="fas fa-times"></i></a>
                         <?php endif; ?>
                     </form>
                 </div>
 
                 <?php
-                $whereClauses = [];
-                if ($search) {
-                    $likeParts = [];
-                    foreach ($cols as $col) {
-                        $safeCol = SQLite3::escapeString($col);
-                        $safeSearch = SQLite3::escapeString($search);
-                        $likeParts[] = "$safeCol LIKE '%$safeSearch%'";
-                    }
-                    if ($likeParts) {
-                        $whereClauses[] = '(' . implode(' OR ', $likeParts) . ')';
-                    }
-                }
-                foreach ($colFilters as $col => $val) {
-                    if (in_array($col, $cols)) {
-                        $safeCol = SQLite3::escapeString($col);
-                        $safeVal = SQLite3::escapeString($val);
-                        $whereClauses[] = "$safeCol LIKE '%$safeVal%'";
-                    }
-                }
-                $where = '';
-                if (!empty($whereClauses)) {
-                    $where = ' WHERE ' . implode(' AND ', $whereClauses);
-                }
-                $countQuery = "SELECT COUNT(*) FROM $safeTable $where";
-                $totalRows = $db->querySingle($countQuery);
-                $pages = ceil($totalRows / $limit);
-                $currentPage = floor($offset / $limit) + 1;
-                $selectCols = $useRowid ? "*, rowid" : "*";
-                $query = "SELECT $selectCols FROM $safeTable $where LIMIT $limit OFFSET $offset";
-                $result = $db->query($query);
+                $whereParameters = [];
+                $where = buildWhere($cols, $search, $colFilters, $whereParameters);
+                $countResult = queryWithTextParameters(
+                    $db,
+                    'SELECT COUNT(*) AS total FROM ' . quoteIdentifier($table) . $where,
+                    $whereParameters
+                );
+                $countRow = $countResult->fetchArray(SQLITE3_ASSOC);
+                $totalRows = (int) ($countRow['total'] ?? 0);
+                $pages = max(1, (int) ceil($totalRows / $limit));
+                if ($offset >= $totalRows && $totalRows > 0) $offset = ($pages - 1) * $limit;
+                $currentPage = min($pages, (int) floor($offset / $limit) + 1);
+                $selectList = $useRowid ? '*, rowid AS "__sqlite_admin_rowid"' : '*';
+                $dataSql = 'SELECT ' . $selectList . ' FROM ' . quoteIdentifier($table) . $where
+                    . ' LIMIT ' . (int) $limit . ' OFFSET ' . (int) $offset;
+                $result = queryWithTextParameters($db, $dataSql, $whereParameters);
                 $rows = [];
-                while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-                    $rows[] = $row;
-                }
+                while ($row = $result->fetchArray(SQLITE3_ASSOC)) $rows[] = $row;
                 ?>
 
-                <?php if (empty($rows)): ?>
-                    <p style="color:var(--text-muted);">No rows found<?php echo $search ? ' matching "' . htmlspecialchars($search) . '"' : ''; ?>.</p>
+                <?php if ($rows === []): ?>
+                    <p style="color:var(--text-muted);">No rows found<?php echo $search !== '' ? ' matching “' . h($search) . '”' : ''; ?>.</p>
                 <?php else: ?>
                     <form method="get" id="col-filter-form" action="">
-                        <input type="hidden" name="table" value="<?php echo htmlspecialchars($table); ?>">
-                        <div class="table-wrap">
-                            <table>
-                                <thead>
-                                    <tr>
-                                        <th style="width:40px;">
-                                            <input type="checkbox" class="select-all" onclick="toggleAll(this);">
-                                        </th>
+                        <input type="hidden" name="table" value="<?php echo h($table); ?>">
+                        <input type="hidden" name="search" value="<?php echo h($search); ?>">
+                        <input type="hidden" name="limit" value="<?php echo $limit; ?>">
+                    </form>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <?php if ($canEditRows): ?>
+                                        <th style="width:40px;"><input type="checkbox" class="select-all" onclick="toggleAll(this);"></th>
                                         <th style="width:80px;">Actions</th>
-                                        <?php foreach ($cols as $col): ?>
-                                            <th><?php echo htmlspecialchars($col); ?></th>
-                                        <?php endforeach; ?>
-                                    </tr>
-                                    <tr id="filter-row" class="filter-row <?php echo empty($colFilters) ? 'hidden' : ''; ?>">
-                                        <td></td>
-                                        <td></td>
-                                        <?php foreach ($cols as $col): ?>
-                                            <td>
-                                                <input type="text" name="col_filters[<?php echo htmlspecialchars($col); ?>]" value="<?php echo htmlspecialchars($colFilters[$col] ?? ''); ?>" placeholder="Filter…" onchange="this.form.submit();">
-                                            </td>
-                                        <?php endforeach; ?>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php foreach ($rows as $row): ?>
-                                        <tr>
-                                            <td>
-                                                <input type="checkbox" name="selected[]" value="<?php echo htmlspecialchars($row[$pkCol] ?? ''); ?>" class="row-checkbox" onchange="updateBulkDeleteButton();">
-                                            </td>
+                                    <?php endif; ?>
+                                    <?php foreach ($cols as $column): ?><th><?php echo h($column); ?></th><?php endforeach; ?>
+                                </tr>
+                                <tr id="filter-row" class="filter-row <?php echo $colFilters === [] ? 'hidden' : ''; ?>">
+                                    <?php if ($canEditRows): ?><td></td><td></td><?php endif; ?>
+                                    <?php foreach ($cols as $column): ?>
+                                        <td><input form="col-filter-form" type="text" name="col_filters[<?php echo h($column); ?>]" value="<?php echo h($colFilters[$column] ?? ''); ?>" placeholder="Filter…" onchange="document.getElementById('col-filter-form').submit();"></td>
+                                    <?php endforeach; ?>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($rows as $row):
+                                    $rowIdentity = $useRowid
+                                        ? ($row['__sqlite_admin_rowid'] ?? '')
+                                        : ($pkCol !== null ? ($row[$pkCol] ?? '') : '');
+                                ?>
+                                    <tr>
+                                        <?php if ($canEditRows): ?>
+                                            <td><input form="bulk-delete-form" type="checkbox" name="selected[]" value="<?php echo h($rowIdentity); ?>" class="row-checkbox" onchange="updateBulkDeleteButton();"></td>
                                             <td>
                                                 <div class="row-actions">
-                                                    <a href="?table=<?php echo urlencode($table); ?>&action=edit&pk=<?php echo urlencode($row[$pkCol] ?? ''); ?><?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>" title="Edit"><i class="fas fa-edit"></i></a>
-                                                    <a href="?table=<?php echo urlencode($table); ?>&action=delete&pk=<?php echo urlencode($row[$pkCol] ?? ''); ?><?php echo $search ? '&search='.urlencode($search) : ''; ?><?php echo !empty($colFilters) ? '&' . http_build_query(['col_filters' => $colFilters]) : ''; ?>" class="danger" title="Delete" onclick="return confirm('Delete this row?');"><i class="fas fa-trash-alt"></i></a>
+                                                    <a href="<?php echo h(getQueryString($table, $search, $colFilters, ['action' => 'edit', 'pk' => $rowIdentity])); ?>" title="Edit"><i class="fas fa-edit"></i></a>
+                                                    <form method="post" action="<?php echo h(getQueryString($table, $search, $colFilters, ['action' => 'delete'])); ?>" class="inline-action-form" onsubmit="return confirm('Delete this row?');">
+                                                        <?php echo csrfField(); ?>
+                                                        <input type="hidden" name="pk" value="<?php echo h($rowIdentity); ?>">
+                                                        <button type="submit" class="row-action-button danger" title="Delete"><i class="fas fa-trash-alt"></i></button>
+                                                    </form>
                                                 </div>
                                             </td>
-                                            <?php foreach ($cols as $col): ?>
-                                                <?php $val = $row[$col] ?? ''; ?>
-                                                <td><?php echo $val === '' ? '<i>NULL</i>' : htmlspecialchars($val); ?></td>
-                                            <?php endforeach; ?>
-                                        </tr>
-                                    <?php endforeach; ?>
-                                </tbody>
-                            </table>
-                        </div>
-                    </form>
-
+                                        <?php endif; ?>
+                                        <?php foreach ($cols as $column):
+                                            $value = array_key_exists($column, $row) ? $row[$column] : null;
+                                            $declaredType = strtoupper($columnTypes[$column] ?? '');
+                                        ?>
+                                            <td><?php
+                                                if ($value === null) {
+                                                    echo '<i>NULL</i>';
+                                                } elseif ($value === '') {
+                                                    echo '<span class="empty-value">(empty)</span>';
+                                                } elseif (str_contains($declaredType, 'BLOB')) {
+                                                    echo '<span title="Binary data">[BLOB ' . number_format(strlen((string) $value)) . ' bytes]</span>';
+                                                } else {
+                                                    echo h($value);
+                                                }
+                                            ?></td>
+                                        <?php endforeach; ?>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
                 <?php endif; ?>
                 <?php endif; ?>
             <?php endif; ?>
@@ -2760,7 +3424,6 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
     </div>
 
     <!-- Fixed Footer Bar -->
-  <!-- Fixed Footer Bar -->
 <?php if ($table !== '' && isset($totalRows) && $totalRows > 0): ?>
 <div class="footer-bar">
     <!-- Footer 1: Credit under sidebar -->
@@ -2771,7 +3434,14 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
     <!-- Footer 2-4: Row count, pagination, license -->
     <div class="footer-right-group">
         <div class="footer-left">
-            <span>Showing <?php echo min($limit, $totalRows - $offset); ?> of <?php echo $totalRows; ?> rows</span>
+            <span>Showing <?php echo number_format(min($limit, max(0, $totalRows - $offset))); ?> of <?php echo number_format($totalRows); ?> rows</span>
+            <label>Rows
+                <select class="page-size-select" onchange="changePageSize(this)">
+                    <?php foreach ($allowedLimits as $option): ?>
+                        <option value="<?php echo $option; ?>" <?php echo $limit === $option ? 'selected' : ''; ?>><?php echo $option; ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </label>
         </div>
         <div class="footer-center">
             <button class="btn btn-outline" onclick="goToPage(1, <?php echo $pages; ?>)" <?php echo $currentPage <= 1 ? 'disabled' : ''; ?>>
@@ -2790,8 +3460,8 @@ $lastModified = file_exists($dbFile) ? date('Y-m-d H:i:s', filemtime($dbFile)) :
             </button>
         </div>
         <div class="footer-right">
-            SQLite Admin 1.0 – <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener">MIT License</a> - 
-            Powered by PHP, JS &amp; SQLite3
+            SQLite Admin <?php echo h(SQLITE_ADMIN_VERSION); ?> – <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener">MIT License</a> ·
+            <a href="<?php echo h(SQLITE_ADMIN_PROJECT_URL); ?>" target="_blank" rel="noopener"><i class="fab fa-github"></i> Report Bugs</a> · PHP &amp; SQLite3
         </div>
     </div>
 </div>
