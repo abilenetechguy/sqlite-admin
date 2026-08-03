@@ -3,21 +3,21 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SQLite Admin 1.1.4</title>
+<title>SQLite Admin 1.1.5</title>
 <style>
 *{box-sizing:border-box}body{margin:0;padding:2rem 1rem;background:#f1f5f9;color:#1e293b;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.65}.page{max-width:880px;margin:auto;padding:2.5rem 3rem;border:1px solid #e2e8f0;border-radius:12px;background:#fff;box-shadow:0 8px 24px rgba(15,23,42,.08)}h1,h2{color:#0f172a;line-height:1.25}h1{margin-top:0;border-bottom:2px solid #e2e8f0;padding-bottom:.55rem}h2{margin-top:2rem;border-bottom:1px solid #e2e8f0;padding-bottom:.3rem;font-size:1.35rem}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}code{padding:.12rem .35rem;border-radius:4px;background:#f1f5f9}pre{overflow:auto;padding:1rem;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc}.badge{display:inline-block;padding:.17rem .55rem;border-radius:999px;background:#2563eb;color:#fff;font-size:.72rem;vertical-align:middle}a{color:#2563eb}.warning{padding:.85rem 1rem;border:1px solid #facc15;border-radius:8px;background:#fefce8}@media(max-width:640px){.page{padding:1.4rem}}
 </style>
 </head>
 <body>
 <main class="page">
-<h1>SQLite Admin <span class="badge">v1.1.4</span></h1>
+<h1>SQLite Admin <span class="badge">v1.1.5</span></h1>
 <p>A lightweight, self-hosted PHP interface for browsing and maintaining SQLite databases.</p>
 <p class="warning"><strong>Administrator tool:</strong> use HTTPS and restrict access with a VPN, IP allowlist, or an additional authentication layer.</p>
 <h2>Requirements</h2>
 <ul><li>PHP 7.0–8.3 (PHP 8.x recommended)</li><li>PHP SQLite3 extension</li><li>Apache, Nginx, or another PHP-capable web server</li><li>Write access to the database directory</li></ul>
 <h2>Installation</h2>
-<ol><li>Upload the repository.</li><li>Open <code>install.php</code>.</li><li>Choose a database filename or path, username, and password.</li><li>Sign in through <code>admin.php</code>.</li></ol>
-<p>The database filename/path field starts empty. Enter a filename such as <code>catalog.sqlite</code>, a relative path such as <code>data/catalog.sqlite</code>, or an absolute server filesystem path. The installer validates SQLite before creating <code>config.php</code>.</p>
+<ol><li>Upload the application files.</li><li>Open <code>install.php</code>.</li><li>Confirm the detected application folder.</li><li>Choose the database location, then enter its filename or path within that location.</li><li>Create the administrator login and sign in through <code>admin.php</code>.</li></ol>
+<p>The installer separates the application folder from the database location. Choose the SQLite Admin folder, its parent, the detected website root, or a custom absolute server path. Linux absolute paths must begin with <code>/</code>. When opening an existing database, leave the create-new-database checkbox unchecked so a typing error cannot silently create an empty database in the wrong folder.</p>
 <h2>Features</h2>
 <ul><li>Browse tables and read-only views</li><li>Insert, edit, delete, search, filter, and paginate rows</li><li>Preserve SQL NULL values, empty strings, and BLOB fields</li><li>Import/export CSV, JSON, SQL, and full databases</li><li>Switch between database files</li><li>Schema tools and manual SQL</li><li>Dark mode, responsive layout, resizable sidebar, and five-action undo</li></ul>
 <h2>Security</h2>

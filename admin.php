@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-const SQLITE_ADMIN_VERSION = '1.1.4';
+const SQLITE_ADMIN_VERSION = '1.1.5';
 const SQLITE_ADMIN_PROJECT_URL = 'https://github.com/abilenetechguy/sqlite-admin';
 
 error_reporting(E_ALL);
